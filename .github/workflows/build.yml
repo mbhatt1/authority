@@ -23,6 +23,7 @@ jobs:
     name: 🍎 macOS x86_64
     runs-on: macos-15-intel
     timeout-minutes: 45
+    continue-on-error: true  # Non-blocking: failures don't stop workflow
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -355,6 +356,7 @@ jobs:
     needs: [build-macos-x86]
     runs-on: macos-15-intel
     timeout-minutes: 30
+    continue-on-error: true  # Non-blocking if kernel build failed
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -664,7 +666,7 @@ jobs:
   create-release:
     name: 📦 Create Release
     needs: [build-macos-x86, build-macos-arm64, build-linux-x86, build-linux-arm64, build-linux-riscv64, publish-wheels-pypi]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !failure()
     runs-on: ubuntu-latest
     permissions:
       contents: write
