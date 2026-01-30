@@ -144,31 +144,24 @@ SRCS-kernel.elf= \
 
 # Authority Kernel sources
 SRCS-agentic= \
-	$(SRCDIR)/agentic/ak_agentic.c \
-	$(SRCDIR)/agentic/ak_approval.c \
-	$(SRCDIR)/agentic/ak_audit.c \
-	$(SRCDIR)/agentic/ak_budget.c \
 	$(SRCDIR)/agentic/ak_capability.c \
-	$(SRCDIR)/agentic/ak_context.c \
-	$(SRCDIR)/agentic/ak_deny_ux.c \
-	$(SRCDIR)/agentic/ak_ed25519.c \
-	$(SRCDIR)/agentic/ak_effects.c \
+	$(SRCDIR)/agentic/ak_audit.c \
 	$(SRCDIR)/agentic/ak_heap.c \
-	$(SRCDIR)/agentic/ak_inference.c \
 	$(SRCDIR)/agentic/ak_ipc.c \
-	$(SRCDIR)/agentic/ak_lz4.c \
-	$(SRCDIR)/agentic/ak_nanos.c \
-	$(SRCDIR)/agentic/ak_pattern.c \
 	$(SRCDIR)/agentic/ak_policy.c \
-	$(SRCDIR)/agentic/ak_policy_v2.c \
-	$(SRCDIR)/agentic/ak_posix_route.c \
-	$(SRCDIR)/agentic/ak_sanitize.c \
-	$(SRCDIR)/agentic/ak_secrets.c \
-	$(SRCDIR)/agentic/ak_state.c \
-	$(SRCDIR)/agentic/ak_state_mgmt.c \
 	$(SRCDIR)/agentic/ak_syscall.c \
+	$(SRCDIR)/agentic/ak_nanos.c \
 	$(SRCDIR)/agentic/ak_wasm.c \
-	$(SRCDIR)/agentic/ak_wasm_host.c
+	$(SRCDIR)/agentic/ak_wasm_host.c \
+	$(SRCDIR)/agentic/ak_inference.c \
+	$(SRCDIR)/agentic/ak_state.c \
+	$(SRCDIR)/agentic/ak_secrets.c \
+	$(SRCDIR)/agentic/ak_ed25519.c \
+	$(SRCDIR)/agentic/ak_sanitize.c \
+	$(SRCDIR)/agentic/ak_approval.c \
+	$(SRCDIR)/agentic/ak_lz4.c \
+	$(SRCDIR)/agentic/ak_pattern.c \
+	$(SRCDIR)/agentic/ak_virtio_proxy.c
 
 SRCS-lwip= \
 	$(LWIPDIR)/src/core/def.c \
