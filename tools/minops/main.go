@@ -63,13 +63,13 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `minops - Minimal Nanos ops with Authority Kernel
 
 Usage:
-  minops run <app.py> [-c config.json] [-m memory] [-p policy.json] [-v]
+  minops run <app.py|app.js|app.ts> [-c config.json] [-m memory] [-p policy.json] [-v]
   minops deploy <tool.wasm> [-p policy.json] [-n name]
   minops tools [-l]
   minops proxy [-s socket] [--llm-provider openai] [--llm-endpoint url]
 
 Commands:
-  run       Run a Python application in Nanos with Authority Kernel
+  run       Run a Python/Node.js application in Nanos with Authority Kernel
   deploy    Deploy a WASM tool to the tool registry
   tools     List deployed tools
   proxy     Start the akproxy daemon for HTTP/LLM services
@@ -98,9 +98,10 @@ Proxy Options:
 
 Examples:
   minops run main.py -c config.json
-  minops run main.py --allow-llm                 # Allow OpenAI, Anthropic, etc.
-  minops run main.py --allow-host api.custom.com:443
+  minops run main.ts --allow-llm                 # Allow OpenAI, Anthropic, etc.
+  minops run app.js --allow-host api.custom.com:443
   minops run examples/01_heap_operations.py -p examples/policies/01_heap_policy.json
+  minops run examples/01-heap-operations.ts -p examples/policies/01_heap_policy.json
   minops deploy mytool.wasm -p tool_policy.json -n my_tool
   minops tools --list
   minops proxy --llm-provider openai --llm-endpoint https://api.openai.com
@@ -121,6 +122,19 @@ var llmEndpoints = []string{
 	"api.fireworks.ai:443",
 	"huggingface.co:443",
 	"api-inference.huggingface.co:443",
+}
+
+// detectAppType determines the runtime based on file extension
+func detectAppType(appFile string) string {
+	ext := strings.ToLower(filepath.Ext(appFile))
+	switch ext {
+	case ".py":
+		return "python"
+	case ".js", ".mjs", ".ts":
+		return "node"
+	default:
+		return "unknown"
+	}
 }
 
 func runApp(args []string) {
@@ -474,20 +488,28 @@ func findBootloader() string {
 
 // findPolicyFile auto-detects policy file based on script name
 // For example: examples/01_heap_operations.py -> examples/policies/01_heap_policy.json
+// Or: examples/01-heap-operations.ts -> examples/policies/01_heap_policy.json
 func findPolicyFile(appFile string) string {
 	basename := filepath.Base(appFile)
 	dir := filepath.Dir(appFile)
+	// Remove extension to get base name
+	nameWithoutExt := strings.TrimSuffix(basename, filepath.Ext(basename))
 
-	// Map script names to policy files
+	// Map script names to policy files (handles both Python and Node.js)
 	policyMapping := map[string]string{
-		"01_heap_operations.py": "01_heap_policy.json",
-		"02_authorization.py":   "02_authorization_policy.json",
-		"03_tool_execution.py":  "03_tool_policy.json",
-		"04_inference.py":       "04_inference_policy.json",
-		"05_audit_logging.py":   "05_audit_policy.json",
+		"01_heap_operations": "01_heap_policy.json",
+		"01-heap-operations": "01_heap_policy.json",
+		"02_authorization":   "02_authorization_policy.json",
+		"02-authorization":   "02_authorization_policy.json",
+		"03_tool_execution":  "03_tool_policy.json",
+		"03-tool-execution":  "03_tool_policy.json",
+		"04_inference":       "04_inference_policy.json",
+		"04-inference":       "04_inference_policy.json",
+		"05_audit_logging":   "05_audit_policy.json",
+		"05-audit-logging":   "05_audit_policy.json",
 	}
 
-	if policyName, ok := policyMapping[basename]; ok {
+	if policyName, ok := policyMapping[nameWithoutExt]; ok {
 		// Look for policy in examples/policies/ relative to app
 		candidates := []string{
 			filepath.Join(dir, "policies", policyName),
@@ -503,14 +525,16 @@ func findPolicyFile(appFile string) string {
 	}
 
 	// Also check for a policy file with matching number prefix
-	// e.g., any 01_*.py -> 01_*_policy.json
-	if len(basename) >= 3 && basename[0:2] >= "01" && basename[0:2] <= "99" {
-		prefix := basename[0:2]
-		policiesDir := filepath.Join(dir, "policies")
-		if entries, err := ioutil.ReadDir(policiesDir); err == nil {
-			for _, entry := range entries {
-				if strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), "_policy.json") {
-					return filepath.Join(policiesDir, entry.Name())
+	// e.g., any 01_*.py or 01-*.ts -> 01_*_policy.json
+	if len(nameWithoutExt) >= 2 {
+		prefix := nameWithoutExt[0:2]
+		if prefix >= "01" && prefix <= "99" {
+			policiesDir := filepath.Join(dir, "policies")
+			if entries, err := ioutil.ReadDir(policiesDir); err == nil {
+				for _, entry := range entries {
+					if strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), "_policy.json") {
+						return filepath.Join(policiesDir, entry.Name())
+					}
 				}
 			}
 		}
@@ -635,8 +659,21 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 		return fmt.Errorf("cannot get absolute path: %v", err)
 	}
 
-	// Program to run - execute Python directly (/bin/python3 now available)
-	program := "/bin/python3"
+	// Auto-detect program based on app type
+	appType := detectAppType(appPath)
+	program := "/bin/python3" // default
+	appFileName := "main.py"   // default
+
+	switch appType {
+	case "node":
+		program = "/bin/node"
+		appFileName = "main.js" // Use .js for Node.js even if input is .ts
+	case "python":
+		program = "/bin/python3"
+		appFileName = "main.py"
+	}
+
+	// Allow override
 	if config.Program != "" {
 		program = config.Program
 	}
@@ -645,9 +682,9 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 	manifest.WriteString("(\n    children:(\n")
 
 	// App file
-	manifest.WriteString("        main.py:(contents:(host:" + absAppPath + "))\n")
+	manifest.WriteString("        " + appFileName + ":(contents:(host:" + absAppPath + "))\n")
 
-	// Bundle /bin directory (Python, shell, etc.)
+	// Bundle /bin directory (Python, Node.js, shell, etc.)
 	pythonRoot := "/tmp/nanos-root"
 
 	// Verify pythonRoot exists
@@ -662,6 +699,10 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 	if _, err := os.Stat(pythonRoot + "/bin/python3"); err == nil {
 		manifest.WriteString("            python3:(contents:(host:" + pythonRoot + "/bin/python3))\n")
 	}
+	// Include Node.js if available
+	if _, err := os.Stat(pythonRoot + "/bin/node"); err == nil {
+		manifest.WriteString("            node:(contents:(host:" + pythonRoot + "/bin/node))\n")
+	}
 	// Always include busybox (should exist from alpine-rootfs COPY)
 	busyboxPath := pythonRoot + "/bin/busybox"
 	manifest.WriteString("            busybox:(contents:(host:" + busyboxPath + "))\n")
@@ -672,7 +713,7 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 	}
 	manifest.WriteString("        ))\n")
 
-	// Bundle /lib directory (runtime libraries including libpython and libak)
+	// Bundle /lib directory (runtime libraries including libpython, Node.js, and libak)
 	manifest.WriteString("        lib:(children:(\n")
 	if _, err := os.Stat(pythonRoot + "/lib/libc.musl-x86_64.so.1"); err == nil {
 		manifest.WriteString("            libc.musl-x86_64.so.1:(contents:(host:" + pythonRoot + "/lib/libc.musl-x86_64.so.1))\n")
@@ -684,11 +725,15 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 	if _, err := os.Stat(pythonRoot + "/usr/lib/libpython3.11.so.1.0"); err == nil {
 		manifest.WriteString("            libpython3.11.so.1.0:(contents:(host:" + pythonRoot + "/usr/lib/libpython3.11.so.1.0))\n")
 	}
+	// Include libv8 if available (required by Node.js)
+	if _, err := os.Stat(pythonRoot + "/lib/libv8.so"); err == nil {
+		manifest.WriteString("            libv8.so:(contents:(host:" + pythonRoot + "/lib/libv8.so))\n")
+	}
 	// Include libak.so (Authority Kernel interface)
 	if _, err := os.Stat(pythonRoot + "/lib/libak.so"); err == nil {
 		manifest.WriteString("            libak.so:(contents:(host:" + pythonRoot + "/lib/libak.so))\n")
 	}
-	// Include libz.so.1 (required for Python compression/SSL)
+	// Include libz.so.1 (required for Python/Node.js compression/SSL)
 	if _, err := os.Stat(pythonRoot + "/lib/libz.so.1"); err == nil {
 		manifest.WriteString("            libz.so.1:(contents:(host:" + pythonRoot + "/lib/libz.so.1))\n")
 	}
@@ -753,13 +798,13 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 	// Enable serial console output
 	manifest.WriteString("console:t ")
 
-	// Add command-line arguments - always use main.py since that's how the app is stored
+	// Add command-line arguments - use appFileName (main.py, main.js, etc.)
 	// For Python programs, add -u flag for unbuffered output by default
 	manifest.WriteString("arguments:[")
 	hasScript := false
 	hasUnbuffered := false
 
-	// Check if -u flag is already present
+	// Check if -u flag is already present (Python only)
 	for _, arg := range config.Args {
 		if arg == "-u" {
 			hasUnbuffered = true
@@ -776,21 +821,21 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 		if i > 0 || (strings.Contains(program, "python") && !hasUnbuffered) {
 			manifest.WriteString(" ")
 		}
-		// Replace the original script name with main.py
-		if strings.HasSuffix(arg, ".py") {
-			manifest.WriteString("main.py")
+		// Replace the original script name with the appropriate app file name
+		if strings.HasSuffix(arg, ".py") || strings.HasSuffix(arg, ".js") || strings.HasSuffix(arg, ".ts") || strings.HasSuffix(arg, ".mjs") {
+			manifest.WriteString(appFileName)
 			hasScript = true
 		} else {
 			manifest.WriteString(arg)
 		}
 	}
-	// If no .py file was in args, add main.py
+	// If no script file was in args, add the app file name
 	if !hasScript {
-		manifest.WriteString(" main.py")
+		manifest.WriteString(" " + appFileName)
 	}
 	manifest.WriteString("]")
 
-	// Add environment variables - always include Python paths for Python programs
+	// Add environment variables - include language-specific paths
 	manifest.WriteString(" environment:(")
 	// Add default Python environment if running Python
 	if strings.Contains(program, "python") {
@@ -801,20 +846,28 @@ func createImage(imagePath, appPath string, kernelPath string, config *Config, v
 		if _, ok := config.Env["PYTHONPATH"]; !ok {
 			manifest.WriteString("PYTHONPATH:/usr/lib/python3.11 ")
 		}
-		// Add LIBAK_PATH for Authority Kernel SDK
-		if _, ok := config.Env["LIBAK_PATH"]; !ok {
-			manifest.WriteString("LIBAK_PATH:/lib/libak.so ")
+	}
+	// Add default Node.js environment if running Node.js
+	if strings.Contains(program, "node") {
+		// Node.js typically uses node_modules for local packages
+		// The app directory will need to be searched for node_modules
+		if _, ok := config.Env["NODE_PATH"]; !ok {
+			manifest.WriteString("NODE_PATH:/usr/lib/node_modules ")
 		}
-		// SSL/TLS certificate paths for HTTPS support (LangChain, CrewAI, etc.)
-		if _, ok := config.Env["SSL_CERT_FILE"]; !ok {
-			manifest.WriteString("SSL_CERT_FILE:/etc/ssl/cert.pem ")
-		}
-		if _, ok := config.Env["SSL_CERT_DIR"]; !ok {
-			manifest.WriteString("SSL_CERT_DIR:/etc/ssl/certs ")
-		}
-		if _, ok := config.Env["REQUESTS_CA_BUNDLE"]; !ok {
-			manifest.WriteString("REQUESTS_CA_BUNDLE:/etc/ssl/cert.pem ")
-		}
+	}
+	// Add LIBAK_PATH for Authority Kernel SDK (for both Python and Node.js)
+	if _, ok := config.Env["LIBAK_PATH"]; !ok {
+		manifest.WriteString("LIBAK_PATH:/lib/libak.so ")
+	}
+	// SSL/TLS certificate paths for HTTPS support (LangChain, CrewAI, etc.)
+	if _, ok := config.Env["SSL_CERT_FILE"]; !ok {
+		manifest.WriteString("SSL_CERT_FILE:/etc/ssl/cert.pem ")
+	}
+	if _, ok := config.Env["SSL_CERT_DIR"]; !ok {
+		manifest.WriteString("SSL_CERT_DIR:/etc/ssl/certs ")
+	}
+	if _, ok := config.Env["REQUESTS_CA_BUNDLE"]; !ok {
+		manifest.WriteString("REQUESTS_CA_BUNDLE:/etc/ssl/cert.pem ")
 	}
 	// Add user-specified environment variables
 	for k, v := range config.Env {

@@ -1,0 +1,70 @@
+{
+  "name": "@authority/nanos",
+  "version": "0.1.0",
+  "description": "Node.js SDK for Authority Nanos - Capability-based security for AI agents",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "module": "lib/index.mjs",
+  "exports": {
+    ".": {
+      "import": "./lib/index.mjs",
+      "require": "./lib/index.js",
+      "types": "./lib/index.d.ts"
+    }
+  },
+  "files": [
+    "lib/**/*",
+    "_binaries/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:watch": "tsc -p tsconfig.build.json --watch",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src/**/*.ts || true",
+    "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts' || true",
+    "prepublishOnly": "npm run build && npm test",
+    "docs": "typedoc src/index.ts || true"
+  },
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^3.0.3",
+    "ref-struct-di": "^1.1.1",
+    "ref-array-di": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/jest": "^29.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.3.0",
+    "prettier": "^3.0.0",
+    "typedoc": "^0.25.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "authority",
+    "nanos",
+    "unikernel",
+    "security",
+    "capability",
+    "ai-agent",
+    "llm",
+    "authorization"
+  ],
+  "author": "Authority Systems",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/authority-systems/nanos.git",
+    "directory": "sdk/nodejs"
+  }
+}
