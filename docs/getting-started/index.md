@@ -1,8 +1,8 @@
 # Quick Start
 
-**Deploy Computer Use Agents with Cryptographic Security**
+**Run an untrusted program under kernel-enforced, capability-based security.**
 
-Authority Nanos is the only way to run computer use agents safely in production. This guide shows you how to deploy agents with capability-based authorization and immutable audit trails.
+Authority runs a single untrusted program per VM and mediates every effect it performs. This guide shows you how to build and run a program with a deny-by-default policy and a tamper-evident audit trail.
 
 ## Getting Started Workflow
 
@@ -19,7 +19,7 @@ flowchart LR
 
     subgraph "3. Run"
         RUN[authority run]
-        APP[Agent Runs]
+        APP[Program Runs]
     end
 
     subgraph "4. Debug"
@@ -34,10 +34,6 @@ flowchart LR
     APP --> DENY
     DENY --> FIX
     FIX --> POLICY
-
-    style POLICY fill:#3498db,color:#fff
-    style APP fill:#27ae60,color:#fff
-    style DENY fill:#e74c3c,color:#fff
 ```
 
 ## Prerequisites
@@ -115,17 +111,12 @@ graph TB
         DB_NET["net.dns: db.internal<br/>net.connect: :5432"]
     end
 
-    subgraph "AI Agent"
-        AI_FS["fs.read: /app/**<br/>fs.write: /app/workspace/**"]
-        AI_NET["net: api.openai.com:443<br/>api.anthropic.com:443"]
-        AI_TOOLS["tools.allow: http_get<br/>tools.deny: shell_exec"]
-        AI_INFER["infer: gpt-4, claude-*"]
-        AI_BUDGET["budgets: 50 calls, 100k tokens"]
+    subgraph "Outbound-Request Program"
+        OB_FS["fs.read: /app/**<br/>fs.write: /app/workspace/**"]
+        OB_NET["net: api.example.com:443"]
+        OB_TOOLS["tools.allow: http_get<br/>tools.deny: shell_exec"]
+        OB_BUDGET["budgets: 50 tool calls, 100k tokens"]
     end
-
-    style WEB_FS fill:#3498db,color:#fff
-    style DB_NET fill:#9b59b6,color:#fff
-    style AI_TOOLS fill:#f39c12,color:#fff
 ```
 
 ### Web Application
@@ -163,7 +154,9 @@ graph TB
 }
 ```
 
-### AI Agent
+### Outbound-Request Program
+
+A program that makes gated outbound requests and calls sandboxed tools, with hard budgets:
 
 ```json
 {
@@ -173,16 +166,12 @@ graph TB
     "write": ["/app/workspace/**"]
   },
   "net": {
-    "dns": ["api.openai.com", "api.anthropic.com"],
-    "connect": ["dns:api.openai.com:443", "dns:api.anthropic.com:443"]
+    "dns": ["api.example.com"],
+    "connect": ["dns:api.example.com:443"]
   },
   "tools": {
     "allow": ["http_get", "file_read"],
     "deny": ["shell_exec"]
-  },
-  "infer": {
-    "models": ["gpt-4", "claude-*"],
-    "max_tokens": 100000
   },
   "budgets": {
     "tool_calls": 50,
@@ -218,6 +207,6 @@ The denial message shows exactly which capability is needed:
 ## Next Steps
 
 - [Installation Guide](/getting-started/installation) - Detailed setup instructions
-- [First Agent](/getting-started/first-agent) - Build your first AI agent
+- [First Program](/getting-started/first-agent) - Build and run your first program
 - [Policy Reference](/policy/) - Complete policy documentation
 - [Security Model](/security/) - Understand the threat model

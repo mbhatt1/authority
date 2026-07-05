@@ -1,10 +1,10 @@
 # Fuzz Testing
 
-This page documents the fuzzing infrastructure for Authority Nanos.
+This page documents the fuzzing infrastructure for Authority.
 
 ## Overview
 
-Fuzzing is critical for security-sensitive code like the Authority Kernel, where input parsing bugs could lead to:
+Fuzzing is critical for security-sensitive code like the Authority kernel, where input parsing bugs could lead to:
 - Policy bypass vulnerabilities
 - Path traversal attacks
 - Denial of service
@@ -16,7 +16,7 @@ Fuzzing is critical for security-sensitive code like the Authority Kernel, where
 
 **Target:** `fuzz_json_parser.c`
 
-Tests the JSON policy parser (`ak_policy_v2.c`) with:
+Tests the JSON policy parsing logic with:
 - Malformed JSON
 - Truncated input
 - Deeply nested structures
@@ -27,7 +27,7 @@ Tests the JSON policy parser (`ak_policy_v2.c`) with:
 
 **Target:** `fuzz_pattern_match.c`
 
-Tests the glob pattern matcher (`ak_pattern.c`) with:
+Tests the glob pattern matcher with:
 - Pathological patterns (many `*` characters)
 - Unicode and special characters
 - Edge cases like empty patterns
@@ -37,7 +37,7 @@ Tests the glob pattern matcher (`ak_pattern.c`) with:
 
 **Target:** `fuzz_path_canonicalize.c`
 
-Tests path canonicalization (`ak_effects.c`) with:
+Tests path and sockaddr canonicalization with:
 - Path traversal attempts (`../../../etc/passwd`)
 - Null byte injection
 - Double slashes

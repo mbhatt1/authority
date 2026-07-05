@@ -29,7 +29,7 @@ Currently, we do not push updates automatically to users. Users must request upd
 ops update
 ```
 
-### Updating Authority Nanos
+### Updating Authority
 
 ```bash
 authority run/load -f

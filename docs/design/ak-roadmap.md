@@ -20,10 +20,10 @@ Each phase has explicit **completion criteria**. No phase is complete until ALL 
 ## P0: Minimal Viable Deny-by-Default
 
 ### Goal
-A working deny-by-default Authority Kernel with:
+A working deny-by-default Authority kernel with:
 - Core effects enforced
 - POSIX compatibility layer
-- Agentic primitives functional
+- Program primitives functional
 - Actionable deny UX
 
 ### P0 Features
@@ -32,14 +32,14 @@ A working deny-by-default Authority Kernel with:
 |---------|-------------|
 | Policy Bootstrap | JSON policy from initrd or embedded |
 | Deny-by-Default | Missing policy = fail closed |
-| Effects Core | `ak_authorize_and_execute()` working |
+| Dispatch Core | `ak_dispatch()` enforcement working |
 | Last Deny | Per-thread last denial with suggestion |
 | FS Routing | open/openat routed through AK |
 | NET Routing | connect routed through AK |
 | DNS Effect | `AK_E_NET_DNS_RESOLVE` with policy gate |
 | TOOL_CALL Effect | Tool execution gated |
 | WASM_INVOKE Effect | WASM execution gated |
-| INFER Effect | Inference gated |
+| OUTBOUND Effect | Outbound external request gated |
 | SOFT Mode | Default routing mode working |
 | Smoke Test | `./tools/smoke.sh` passes |
 
@@ -47,12 +47,12 @@ A working deny-by-default Authority Kernel with:
 
 - [ ] **Policy Bootstrap**: JSON policy loads from `/ak/policy.json` in initrd
 - [ ] **Fail Closed**: Missing policy = deny-all with clear console message
-- [ ] **Effects Core**: All P0 effects route through `ak_authorize_and_execute()`
+- [ ] **Dispatch Core**: All P0 effects route through `ak_dispatch()`
 - [ ] **Last Deny**: Denied operations populate last_deny with proper information
 - [ ] **FS Routing**: `open()` and `openat()` create `AK_E_FS_OPEN` effect
 - [ ] **NET Routing**: `connect()` creates `AK_E_NET_CONNECT` effect
 - [ ] **DNS Gate**: DNS resolution creates `AK_E_NET_DNS_RESOLVE` effect
-- [ ] **Agentic Effects**: All agentic effects enforced
+- [ ] **Program Effects**: All program effects (tools, WASM, outbound) enforced
 - [ ] **Mode**: SOFT mode is default and functional
 - [ ] **Unit Tests**: Pattern matching, JSON parsing, canonicalization all pass
 - [ ] **Integration Tests**: allow/deny scenarios pass
@@ -111,7 +111,7 @@ Full process model and advanced isolation.
 |---------|-------------|
 | PROC_SPAWN | Process creation effect |
 | Exec/Fork | Exec and fork interception |
-| Streaming | Streaming tool/infer responses |
+| Streaming | Streaming tool/outbound-request responses |
 | Enhanced Sandbox | Stronger WASM isolation |
 | Attestation | Policy attestation for remote verification |
 

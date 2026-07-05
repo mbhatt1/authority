@@ -1,50 +1,33 @@
 # TOML Policy Format
 
-::: warning P1 Feature
-TOML policy format is planned for P1. Currently, use the [JSON format](/policy/json-format).
+::: warning Planned — not in the kernel build
+A TOML policy format is planned as a human-friendly authoring format. The TOML compiler (`ak_policy_toml.c`) is **not** compiled into the current kernel. Use the [JSON format](/policy/json-format), which the compiled engine parses.
 :::
 
 ## Overview
 
-TOML provides a more human-friendly policy format:
+TOML would provide a more human-friendly way to author the same schema the [JSON engine](/policy/json-format) parses (`tools`, `domains`, `taint`, `budgets`):
 
 ```toml
 version = "1.0"
-
-[fs]
-read = [
-    "/app/**",
-    "/lib/**",
-    "/etc/ssl/**"
-]
-write = [
-    "/tmp/**",
-    "/app/data/**"
-]
-
-[net]
-dns = ["api.github.com", "*.googleapis.com"]
-connect = [
-    "dns:api.github.com:443",
-    "dns:*.googleapis.com:443"
-]
-bind = ["ip:0.0.0.0:8080"]
-listen = ["ip:0.0.0.0:8080"]
 
 [tools]
 allow = ["http_get", "http_post", "file_read"]
 deny = ["shell_exec"]
 
-[infer]
-models = ["gpt-4", "claude-*"]
-max_tokens = 100000
+[domains]
+allow = ["api.github.com", "*.googleapis.com"]
+deny = ["*.internal"]
+
+[taint]
+sources = ["external_response"]
+sinks = ["outbound_request"]
+sanitizers = ["validate_json"]
 
 [budgets]
-tool_calls = 100
+calls = 100
 tokens = 100000
-wall_time_ms = 300000
-
-profiles = ["tier1-musl"]
+inference_ms = 60000
 ```
 
 ## Benefits over JSON
@@ -53,7 +36,6 @@ profiles = ["tier1-musl"]
 |---------|------|------|
 | Comments | No | Yes (`#`) |
 | Trailing commas | No | Yes |
-| Multi-line strings | Escaped | Native |
 | Readability | Moderate | High |
 
 ## Example with Comments
@@ -61,82 +43,41 @@ profiles = ["tier1-musl"]
 ```toml
 version = "1.0"
 
-# Filesystem access
-[fs]
-read = [
-    "/app/**",      # Application files
-    "/lib/**",      # System libraries
-    "/etc/ssl/**",  # SSL certificates
-]
-write = [
-    "/tmp/**",      # Temporary files
-    "/app/logs/**", # Application logs
-]
-
-# Network access - be specific!
-[net]
-dns = [
-    "api.github.com",
-    "api.anthropic.com",
-]
-connect = [
-    "dns:api.github.com:443",
-    "dns:api.anthropic.com:443",
-]
-
 # Tool permissions
 [tools]
 allow = [
-    "http_get",   # Safe read-only HTTP
+    "http_get",   # Read-only HTTP
     "file_read",  # Read files within policy
 ]
 deny = [
-    "shell_exec", # NEVER allow shell execution
+    "shell_exec", # Never allow shell execution
 ]
 
-# LLM inference
-[infer]
-models = ["claude-*"]  # Any Claude model
-max_tokens = 100_000   # Underscore for readability
+# Outbound destinations
+[domains]
+allow = [
+    "api.github.com",
+    "api.example.com",
+]
 
 # Resource budgets
 [budgets]
-tool_calls = 100
-tokens = 100_000
-wall_time_ms = 300_000  # 5 minutes
-
-# Include base profile
-profiles = ["tier1-musl"]
+calls = 100
+tokens = 100_000        # Underscore for readability
+inference_ms = 60_000
 ```
 
-## Compilation
+## Intended Compilation
 
-TOML policies are compiled to JSON at build time:
+A TOML policy would be compiled to JSON at build time and embedded or placed in the initrd:
 
 ```makefile
 policy.json: ak.toml
-    $(TOOLS)/ak-compile $< $@
+	$(TOOLS)/ak-compile $< $@
 
 INITRD_FILES += /ak/policy.json:policy.json
 ```
 
-## Validation
-
-The TOML compiler performs:
-
-1. Syntax validation
-2. Schema validation
-3. Pattern validation
-4. Security warnings (e.g., overly permissive rules)
-
-## Migration from JSON
-
-To convert an existing JSON policy to TOML:
-
-```bash
-ak-convert policy.json > policy.toml
-```
-
 ## Current Status
 
-TOML support is planned for P1. For now, use the JSON format which provides identical functionality.
+TOML support is not yet compiled into the kernel. For now, use the JSON format, which provides the full functionality of the current policy engine.

@@ -1,10 +1,10 @@
 # Trace Utilities
 
-This page documents the kernel tracing and analysis tools for Authority Nanos.
+This page documents the kernel tracing and analysis tools for Authority.
 
 ## Overview
 
-Authority Nanos implements a tracing mechanism inspired by [Linux' ftrace](https://www.kernel.org/doc/Documentation/trace/ftrace.txt). Trace utilities help you analyze kernel behavior and identify performance bottlenecks.
+Authority implements a tracing mechanism inspired by [Linux' ftrace](https://www.kernel.org/doc/Documentation/trace/ftrace.txt). Trace utilities help you analyze kernel behavior and identify performance bottlenecks.
 
 ## Enabling Tracing
 

@@ -40,3 +40,7 @@ latest.txt
 # Environment files with secrets
 .env
 .env.local
+
+# generated docs site build output
+docs/.vitepress/dist/
+docs/.vitepress/cache/

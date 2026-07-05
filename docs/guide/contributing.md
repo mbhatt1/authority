@@ -1,6 +1,6 @@
-# Contributing to Authority Nanos
+# Contributing to Authority
 
-Thank you for your interest in contributing to Authority Nanos!
+Thank you for your interest in contributing to Authority!
 
 ## Style Guide
 
@@ -8,7 +8,7 @@ Thank you for your interest in contributing to Authority Nanos!
 
 ## License
 
-All contributions to Authority Nanos are made under the Apache 2.0 License.
+All contributions to Authority are made under the Apache 2.0 License.
 
 ## Getting Help
 

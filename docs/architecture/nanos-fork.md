@@ -1,6 +1,6 @@
 # Fork Relationship
 
-Authority Nanos is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** — the original unikernel developed by [NanoVMs](https://nanovms.com).
+Authority is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** — the original unikernel developed by [NanoVMs](https://nanovms.com).
 
 ## What is Nanos?
 
@@ -12,11 +12,11 @@ Nanos is a production-quality unikernel designed to run single applications with
 - **Small footprint**: ~20MB base memory
 - **Cross-platform**: x86_64 and ARM64
 
-## What Authority Nanos Adds
+## What Authority Adds
 
-Authority Nanos extends Nanos with the **Authority Kernel** subsystem:
+Authority extends Nanos with the **Authority Kernel** subsystem:
 
-| Feature | Nanos | Authority Nanos |
+| Feature | Nanos | Authority |
 |---------|-------|-----------------|
 | Unikernel base | Yes | Yes |
 | Cross-platform | Yes | Yes |
@@ -24,8 +24,8 @@ Authority Nanos extends Nanos with the **Authority Kernel** subsystem:
 | Deny-by-default policy | No | Yes |
 | Audit logging | No | Yes (hash-chained) |
 | Budget enforcement | No | Yes |
-| LLM integration | No | Yes (native) |
-| Tool sandboxing | No | Yes (WASM) |
+| Gated outbound requests | No | Yes |
+| Tool sandboxing | No | Yes (integer-only WASM) |
 
 ## Repository Structure
 
@@ -41,7 +41,7 @@ authority-nanos/
 
 ## Upstream Compatibility
 
-Authority Nanos maintains **full compatibility** with upstream Nanos:
+Authority maintains **full compatibility** with upstream Nanos:
 
 - All existing Nanos applications run unchanged (with `AK_MODE_OFF`)
 - Standard ops workflows continue to work
@@ -55,16 +55,19 @@ The Authority Kernel is implemented in `nanos/src/agentic/`:
 src/agentic/
 ├── ak_config.h          # Feature toggles and limits
 ├── ak_types.h           # Core type definitions
-├── ak_syscall.c         # Syscall dispatch (1024-1100)
+├── ak_syscall.c         # Syscall handler + ak_dispatch() pipeline (1024+)
 ├── ak_policy.c          # Policy loading and evaluation
-├── ak_audit.c           # Hash-chained audit log
-├── ak_capability.c      # HMAC token verification
-├── ak_effects.c         # Effect authorization
-├── ak_context.c         # Per-thread context
-├── ak_wasm.c            # WASM sandbox runtime
-├── ak_inference.c       # LLM gateway
+├── ak_audit.c           # Hash-chained audit log (durable before response)
+├── ak_capability.c      # HMAC token verification (per-boot key)
+├── ak_budget.c          # Hard budget admission control
+├── ak_wasm_interp.c     # Integer-only WASM subset interpreter
+├── ak_inference.c       # Gated outbound request handler (issue/poll)
 └── README.md            # Component documentation
 ```
+
+> `ak_effects.c` also lives in this directory but is **not compiled into the
+> kernel** — it is legacy code excluded from the build. The compiled
+> enforcement path is `ak_syscall_handler` → `ak_dispatch` in `ak_syscall.c`.
 
 ## Build Configuration
 
@@ -73,9 +76,10 @@ The Authority Kernel is enabled by default:
 ```makefile
 # In kernel.mk
 CFLAGS += -DCONFIG_AK_ENABLED=1
-CFLAGS += -DCONFIG_AK_EFFECTS=1
-CFLAGS += -DAK_DEFAULT_MODE=AK_MODE_SOFT
 ```
+
+The kernel is built `-mno-sse` (no floating point) so the integer-only WASM
+interpreter and the rest of the Authority Kernel remain float-free.
 
 To build without Authority Kernel (pure Nanos):
 
@@ -89,20 +93,20 @@ Improvements to the core Nanos kernel (not Authority Kernel specific) should be 
 
 1. Identify if the change is AK-specific or general Nanos
 2. For general changes, submit PR to [nanovms/nanos](https://github.com/mbhatt1/nanos)
-3. For AK-specific changes, submit PR to Authority Nanos
+3. For AK-specific changes, submit PR to Authority
 
 ## Why Fork?
 
-Forking allows Authority Nanos to:
+Forking allows Authority to:
 
-1. **Add security features** that aren't needed for general-purpose unikernels
-2. **Maintain AI-first focus** without burdening the main Nanos project
-3. **Move fast** on agent-specific features while Nanos maintains stability
+1. **Add capability-based enforcement** that isn't needed for general-purpose unikernels
+2. **Keep the security subsystem self-contained** without burdening the main Nanos project
+3. **Move fast** on enforcement features while Nanos maintains stability
 4. **Stay compatible** by regularly merging upstream changes
 
 ## Syncing with Upstream
 
-Authority Nanos periodically syncs with upstream Nanos:
+Authority periodically syncs with upstream Nanos:
 
 ```bash
 # Add upstream remote

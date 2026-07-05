@@ -2,52 +2,47 @@
 
 ## General Questions
 
-### What is Authority Nanos?
+### What is Authority?
 
-Authority Nanos is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** that adds the Authority Kernel — a capability-based security layer designed specifically for running autonomous AI agents in production.
+Authority is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** that adds the Authority kernel — a capability-based security layer that runs a single untrusted program per VM and enforces kernel-level security on every effect that program performs.
 
-### How is Authority Nanos different from standard Nanos?
+### How is Authority different from standard Nanos?
 
-Authority Nanos extends Nanos with:
-- Capability-based security with HMAC-SHA256 tokens
-- Hash-chained audit logs for complete auditability
-- Native LLM inference gateway (local models + external APIs)
-- Typed heap with versioned objects and CAS semantics
-- Policy engine for declarative security rules
-- WASM sandbox for tool execution
-- AI-first syscalls optimized for agent workloads
+Authority extends Nanos with:
+- Capability-based security with unforgeable HMAC-SHA256 tokens
+- A hash-chained, tamper-evident audit log
+- A deny-by-default policy engine for filesystem, network, and tool access
+- Hard resource budgets enforced before admission
+- An integer-only WASM sandbox for tool execution
+- A typed heap with versioned objects and CAS semantics
+- An outbound-request handler that gates external I/O behind a capability
 
-### Why use Authority Nanos for AI agents?
+### Why run an untrusted program on Authority?
 
-**Security**: Traditional OSes weren't designed for autonomous agents. Authority Nanos provides:
-- Zero-trust by default — every operation requires explicit capability
-- Complete audit trails for compliance and debugging
-- Budget enforcement to prevent runaway costs
-- Fail-closed security model
+**Containment.** A single untrusted program runs in its own VM, and the kernel mediates everything it does:
+- Deny-by-default — every effect requires an explicit policy rule and capability
+- Complete audit trail for compliance and incident analysis
+- Budget enforcement to bound resource and cost consumption
+- Fail-closed: unknown operations are denied before execution, not logged after
 
-**AI-Native**: Built-in support for:
-- Local LLM inference via virtio-serial (Ollama, vLLM)
-- External API routing (OpenAI, Anthropic, custom)
-- Tool execution in sandboxed WASM environment
-
-**Isolation**: Unikernel architecture eliminates:
-- Privilege escalation attacks (no users or privileges)
-- Container escape vulnerabilities
-- Unnecessary attack surface (minimal syscalls)
+**Isolation.** The single-process unikernel design eliminates:
+- Privilege-escalation attacks (no users, no sudo, no setuid)
+- Container-escape vulnerabilities
+- Unnecessary attack surface (a minimal syscall set)
 
 ## Architecture Questions
 
 ### Is 32-bit supported?
 
-No, and there's no intention to add support. Authority Nanos focuses on modern 64-bit architectures (x86_64 and ARM64).
+No, and there's no intention to add support. Authority focuses on modern 64-bit architectures (x86_64 and ARM64).
 
 ### Do you support multiple processes?
 
-No. Authority Nanos is a **single-process unikernel**. For multiple agents, deploy multiple VMs, each running one agent.
+No. Authority is a **single-process unikernel** that runs exactly one program per VM. To run more than one workload, deploy multiple VMs.
 
 ### Do you support multiple threads?
 
-**Yes**. Authority Nanos fully supports multi-threading within the single process.
+**Yes.** Authority fully supports multi-threading within the single process.
 
 ### What platforms are supported?
 
@@ -59,32 +54,52 @@ No. Authority Nanos is a **single-process unikernel**. For multiple agents, depl
 - Full production support
 - Raspberry Pi 4, AWS Graviton, Azure Ampere
 
-## AI & LLM Questions
+## Enforcement Questions
 
-### Does Authority Nanos support local models?
+### How is every syscall enforced?
 
-**Yes**. Local model support is a core feature via virtio-serial communication:
-- Ollama (recommended)
-- vLLM (high performance)
-- llama.cpp (lightweight)
-- Any inference server speaking JSON over stdio
+Every effectful syscall enters through `ak_syscall_handler`, which calls `ak_dispatch()`. `ak_dispatch()` runs a fixed six-stage pipeline before any effect executes:
 
-### Can I use external LLM APIs?
+1. **Request validation** — the request structure is parsed and validated
+2. **Anti-replay** — replayed or stale requests are rejected
+3. **Capability** — the HMAC-SHA256 capability is verified
+4. **Policy + budget** — the operation is checked against the deny-by-default policy and remaining budgets
+5. **Execute** — the effect is performed
+6. **Audit** — the request and result are appended to the hash-chained audit log
 
-**Yes**. Authority Nanos supports:
-- OpenAI (GPT-4, etc.)
-- Anthropic (Claude)
-- Custom endpoints (any OpenAI-compatible API)
+### How does external I/O work?
 
-### What is hybrid mode?
+Outbound I/O (HTTP requests, tool calls) uses an asynchronous issue/poll model. The program issues a request via `AK_SYS_INFER_ISSUE`, which is enforced synchronously (validation, capability, policy, budget) on the issue path. The actual I/O runs on the kernel runloop (`ak_https_issue`/`ak_https_poll`), and the program later retrieves the result with `AK_SYS_INFER_POLL`. There is no synchronous, in-kernel blocking external I/O.
 
-Hybrid mode allows intelligent routing between local and external models based on model name, cost optimization, or availability.
+### What are the syscall numbers?
+
+| Syscall | Number |
+|---------|--------|
+| `AK_SYS_READ` | 1024 |
+| `AK_SYS_ALLOC` | 1025 |
+| `AK_SYS_WRITE` | 1026 |
+| `AK_SYS_DELETE` | 1027 |
+| `AK_SYS_QUERY` | 1028 |
+| `AK_SYS_BATCH` | 1029 |
+| `AK_SYS_COMMIT` | 1030 |
+| `AK_SYS_CALL` | 1031 |
+| `AK_SYS_SPAWN` | 1032 |
+| `AK_SYS_SEND` | 1033 |
+| `AK_SYS_RECV` | 1034 |
+| `AK_SYS_RESPOND` | 1035 |
+| `AK_SYS_ASSERT` | 1036 |
+| `AK_SYS_INFERENCE` | 1037 |
+| `AK_SYS_BUDGET_STATUS` | 1038 |
+| `AK_SYS_BUDGET_HISTORY` | 1039 |
+| `AK_SYS_BUDGET_BREAKDOWN` | 1040 |
+| `AK_SYS_INFER_ISSUE` | 1041 |
+| `AK_SYS_INFER_POLL` | 1042 |
 
 ## Security Questions
 
 ### What are the security invariants?
 
-Authority Nanos enforces four foundational guarantees:
+Authority enforces four foundational guarantees:
 
 - **INV-1**: Every external effect occurs through a kernel-mediated syscall
 - **INV-2**: Every effectful syscall requires a valid capability
@@ -94,7 +109,7 @@ Authority Nanos enforces four foundational guarantees:
 ### How do capabilities work?
 
 Capabilities are **unforgeable HMAC-SHA256 signed tokens** granting specific permissions:
-- Type (Net, FS, Tool, Inference)
+- Type (Net, FS, Tool, Outbound Request)
 - Resource pattern
 - Allowed methods
 - Time-to-live
@@ -102,15 +117,15 @@ Capabilities are **unforgeable HMAC-SHA256 signed tokens** granting specific per
 
 ### Are audit logs tamper-proof?
 
-**Yes**. The audit log uses cryptographic hash chaining. Any modification breaks the chain and is immediately detectable.
+**Yes.** The audit log uses cryptographic hash chaining. Any modification breaks the chain and is immediately detectable.
 
-### Can agents escape the sandbox?
+### Can the program escape the sandbox?
 
-**No**. Multiple layers of isolation:
+**No.** Multiple layers of isolation apply:
 - Unikernel boundary (single-process design)
-- Capability enforcement (cryptographic verification)
-- WASM sandbox (no direct system access)
-- Network isolation (policy-controlled)
+- Capability enforcement (cryptographic verification on every effect)
+- Integer-only WASM sandbox for tools (no direct system access; floats rejected)
+- Network isolation (deny-by-default, policy-controlled)
 
 ## Deployment Questions
 
@@ -123,8 +138,8 @@ Capabilities are **unforgeable HMAC-SHA256 signed tokens** granting specific per
 - **Hyper-V** (Windows) — experimental
 
 ### How do I deploy to cloud providers?
-Use the [authority CLI](https://authority.dev) which supports AWS, GCP, Azure, DigitalOcean, Vultr, and more.
 
+Use the [authority CLI](https://authority.dev), which supports AWS, GCP, Azure, DigitalOcean, Vultr, and more.
 
 ### Can I run on edge devices?
 
@@ -142,15 +157,18 @@ Use the [authority CLI](https://authority.dev) which supports AWS, GCP, Azure, D
 git clone https://github.com/nanovms/authority-nanos.git
 cd authority-nanos/nanos
 
-# Build
-make kernel
+# Build for x86_64
+make PLATFORM=pc CROSS_COMPILE=x86_64-elf- kernel
+
+# Build for ARM64
+make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- kernel
 ```
 
-### How do I debug agent issues?
+### How do I debug a denied operation?
 
 1. **Audit log analysis**: Query the audit log for the run
 2. **Last error syscall**: Call `AK_SYS_LAST_ERROR` for denial details
-3. **Record mode**: Run with `AK_RECORD=1` to accumulate suggestions
+3. **Record mode**: Run with `AK_RECORD=1` to accumulate policy suggestions
 
 ### Can I contribute?
 
@@ -158,13 +176,13 @@ make kernel
 
 Priority areas:
 - Security (policy language, formal verification)
-- AI integration (new providers, streaming)
+- Enforcement pipeline and capability system
 - Tools (WASM runtime, policy validators)
 - Monitoring (metrics, alerting)
 
 ## Licensing & Support
 
-### What license is Authority Nanos under?
+### What license is Authority under?
 
 **Apache License 2.0** (open source)
 - Commercial use allowed

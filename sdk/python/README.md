@@ -1,6 +1,10 @@
-# Authority Nanos Python SDK
+# Authority Python SDK
 
-Secure AI agent development with capability-based authorization.
+The Authority SDK for writing programs that run under Authority, a
+capability-based security unikernel. Every operation goes through the kernel,
+where it is checked against the caller's cryptographic capability, evaluated
+against a deny-by-default policy and hard resource budgets, and recorded in a
+tamper-evident audit log.
 
 ## Installation
 
@@ -13,7 +17,7 @@ pip install authority-nanos
 ```python
 from authority_nanos import AuthorityKernel
 
-# Simulation mode - works without kernel
+# Simulation mode - works without a kernel
 with AuthorityKernel(simulate=True) as ak:
     # Allocate a typed object
     handle = ak.alloc("counter", b'{"value": 0}')
@@ -25,7 +29,7 @@ with AuthorityKernel(simulate=True) as ak:
     # Update with JSON Patch
     ak.write(handle, b'[{"op": "replace", "path": "/value", "value": 42}]')
 
-# Real mode - requires running kernel
+# Real mode - requires a running kernel
 with AuthorityKernel() as ak:
     # Same API, but operations go through the kernel
     handle = ak.alloc("counter", b'{"value": 0}')
@@ -33,12 +37,13 @@ with AuthorityKernel() as ak:
 
 ## Features
 
-- **Simulation Mode**: Test your agents without running the kernel
-- **Typed Heap**: Allocate, read, write, delete typed objects
-- **Authorization**: Policy-controlled access to resources
-- **Tool Execution**: Run WASM tools in sandbox
-- **LLM Inference**: Policy-controlled LLM access
-- **Audit Logging**: Tamper-evident audit trail
+- **Simulation Mode**: Develop and test against the API without running the kernel
+- **Typed Heap**: Allocate, read, write, and delete versioned typed objects
+- **Authorization**: Capability-checked, policy-controlled access to resources
+- **Tool Execution**: Run integer-only WASM tools in a sandbox
+- **Outbound Requests**: Issue capability-gated external requests, charged against the budget
+- **Budget Queries**: Read the kernel's hard resource budgets (tokens, tool calls, wall time, bytes)
+- **Audit Log**: Read the tamper-evident, hash-chained audit trail
 
 ## Documentation
 

@@ -1,6 +1,6 @@
 # {{PROJECT_NAME}}
 
-A full-featured Authority Nanos agent with comprehensive capabilities.
+A full-featured starter program that runs under Authority, using the Authority SDK.
 
 ## Features
 
@@ -28,7 +28,7 @@ A full-featured Authority Nanos agent with comprehensive capabilities.
    python agent.py --interactive
    ```
 
-4. Run with Authority Kernel:
+4. Run under the Authority kernel:
    ```bash
    authority run agent.py --policy policy.json
    ```
@@ -42,7 +42,7 @@ A full-featured Authority Nanos agent with comprehensive capabilities.
 
 ```
 {{PROJECT_NAME}}/
-|-- agent.py          # Main agent implementation
+|-- agent.py          # Main program implementation
 |-- policy.json       # Security policy
 |-- config.json       # Runtime configuration
 |-- requirements.txt  # Python dependencies
@@ -53,7 +53,7 @@ A full-featured Authority Nanos agent with comprehensive capabilities.
 
 ## Configuration
 
-Edit `config.json` to customize agent behavior:
+Edit `config.json` to customize the program's behavior:
 
 ```json
 {
@@ -71,15 +71,15 @@ Edit `config.json` to customize agent behavior:
 
 The policy (`policy.json`) enables:
 - Heap operations with up to 100MB storage
-- Network access to LLM APIs
+- Network access for capability-gated outbound requests
 - Filesystem access to config, data, and log directories
-- Environment variable access for API keys
+- Environment variable access for credentials
 - Audit logging for all operations
 
 ## Architecture
 
 ### StateManager
-Manages agent state and tasks using the Authority Kernel's typed heap.
+Manages program state and tasks using the Authority kernel's typed heap.
 
 ```python
 state_manager = StateManager(kernel)
@@ -97,7 +97,7 @@ auto_cleanup = config.get("features.auto_cleanup", True)
 ```
 
 ### Agent
-Main agent class that orchestrates state and task execution.
+The main class that orchestrates state and task execution.
 
 ```python
 agent = Agent(config, state_manager)
@@ -106,7 +106,7 @@ agent.execute_task("My task")
 agent.stop()
 ```
 
-## Extending the Agent
+## Extending the Program
 
 ### Adding New Task Types
 
@@ -118,20 +118,19 @@ def execute_custom_task(self, data: dict) -> str:
     return result
 ```
 
-### Adding External Integrations
+### Adding Outbound Requests
 
-The policy allows network access to LLM APIs. Add integrations in `agent.py`:
+The policy allows network access for outbound requests. Issue them through the
+kernel so they are gated by policy and capabilities and charged against the
+budget:
 
 ```python
-from langchain_openai import ChatOpenAI
-
-llm = ChatOpenAI(model="gpt-4")
-response = llm.invoke("Your prompt")
+response = kernel.inference(prompt="your payload", max_tokens=100)
 ```
 
 ## Learn More
 
-- [Authority Nanos Documentation](https://authority-systems.github.io/nanos)
+- [Authority Documentation](https://authority-systems.github.io/nanos)
 - [Policy Format Reference](https://authority-systems.github.io/nanos/policy/)
 - [API Reference](https://authority-systems.github.io/nanos/api/)
 - [Security Best Practices](https://authority-systems.github.io/nanos/security/)

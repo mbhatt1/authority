@@ -1,184 +1,83 @@
-# Effects Reference
+# Request Authorization Reference
 
-Effects are the fundamental unit of authorization in the Authority Kernel.
+This page describes how the Authority Kernel authorizes each syscall: the capability scope it requires and how targets are canonicalized before policy matching.
 
-## Effect Processing Pipeline
+> **Legacy note.** Earlier drafts described an "effects" layer (`ak_effect_op_t`, `AK_E_*` opcodes, `ak_authorize_and_execute()`, `ak_effect_from_open()`), implemented in `ak_effects.c`. That file is **not compiled into the kernel** — it is excluded from the build and is legacy/dead code. The compiled enforcement path authorizes syscalls directly: `ak_syscall_handler()` → `ak_dispatch()` → per-op capability, policy, and budget checks. The `AK_E_*` opcodes below the fold are retained only as historical reference and do not describe runtime behavior.
+
+## How a Syscall Is Authorized
+
+During stage 3 of the dispatch pipeline, `ak_validate_capability()` maps the syscall's op and arguments to a required capability **type**, **resource**, and **method**, then requires a capability (explicit token, delegated grant, or root admin cap) whose scope subsumes that tuple. Deny-by-default: if nothing subsumes it, the request fails closed.
 
 ```mermaid
 flowchart LR
     subgraph "Input"
-        POSIX[POSIX Syscall]
-        AK_SYS[AK Syscall]
-        TOOL[Tool Call]
+        SYS[AK Syscall + args]
     end
 
-    subgraph "Effect Creation"
-        BUILD[Build Effect]
-        CANON[Canonicalize Target]
+    subgraph "Authorization (stage 3-4)"
+        MAP[Map op -> type/resource/method]
+        CANON[Canonicalize target]
+        CAP[Capability subsumes?]
+        POLICY[Policy allows?]
+        BUDGET[Budget OK?]
     end
 
-    subgraph "Authorization"
-        GATE[Authority Gate]
-        CAP[Capability Check]
-        POLICY[Policy Match]
-        BUDGET[Budget Check]
-    end
-
-    subgraph "Execution"
+    subgraph "Then"
         EXEC[Execute]
-        AUDIT[Audit Log]
+        AUDIT[Audit - durable]
     end
 
-    POSIX --> BUILD
-    AK_SYS --> BUILD
-    TOOL --> BUILD
-
-    BUILD --> CANON
-    CANON --> GATE
-    GATE --> CAP
+    SYS --> MAP
+    MAP --> CANON
+    CANON --> CAP
     CAP --> POLICY
     POLICY --> BUDGET
     BUDGET --> EXEC
     EXEC --> AUDIT
 
-    style GATE fill:#e74c3c,color:#fff
+    style CAP fill:#e74c3c,color:#fff
     style CANON fill:#3498db,color:#fff
+    style AUDIT fill:#2ecc71,color:#fff
 ```
 
-## What is an Effect?
+## Required Capability by Syscall
 
-An **effect** is any operation that:
-- Accesses external resources (files, network)
-- Modifies state (heap, audit log)
-- Consumes resources (tokens, API calls)
+| Syscall | Capability type | Resource scope | Method |
+|---------|-----------------|----------------|--------|
+| `AK_SYS_READ` / `WRITE` / `DELETE` | `AK_CAP_HEAP` | heap pointer (decimal) | op name |
+| `AK_SYS_ALLOC` | `AK_CAP_HEAP` | type hash | op name |
+| `AK_SYS_BATCH` | `AK_CAP_HEAP` | `*` (per-op re-validated) | op name |
+| `AK_SYS_CALL` | `AK_CAP_TOOL` | tool name | `invoke` |
+| `AK_SYS_INFERENCE` / `INFER_ISSUE` | `AK_CAP_LLM` (= INFERENCE) | request target | `inference` |
+| `AK_SYS_SPAWN` | `AK_CAP_SPAWN` | program (or `*`) | `spawn` |
+| `AK_SYS_SEND` | `AK_CAP_IPC` | recipient | op name |
+| `AK_SYS_RECV` | `AK_CAP_IPC` | `*` (own inbox) | op name |
+| `AK_SYS_QUERY` | `AK_CAP_ANY` | `audit_log` | op name |
+| `COMMIT` / `RESPOND` / `ASSERT` | `AK_CAP_ANY` | `*` | op name |
 
-POSIX syscalls are translated into effects before policy evaluation.
+Capabilities that fail to extract a required field (e.g. a `CALL` with no `tool`, or an outbound request with no target) are rejected fail-closed with `E_CAP_SCOPE`.
 
-## Effect Types
-
-```mermaid
-graph TB
-    subgraph "Filesystem (0x01xx)"
-        FS_OPEN[FS_OPEN<br/>0x0100]
-        FS_UNLINK[FS_UNLINK<br/>0x0101]
-        FS_RENAME[FS_RENAME<br/>0x0102]
-        FS_MKDIR[FS_MKDIR<br/>0x0103]
-    end
-
-    subgraph "Network (0x02xx)"
-        NET_CONNECT[NET_CONNECT<br/>0x0200]
-        NET_DNS[NET_DNS_RESOLVE<br/>0x0201]
-        NET_BIND[NET_BIND<br/>0x0202]
-        NET_LISTEN[NET_LISTEN<br/>0x0203]
-    end
-
-    subgraph "Process (0x03xx)"
-        PROC_SPAWN[PROC_SPAWN<br/>0x0300]
-    end
-
-    subgraph "Agentic (0x04xx)"
-        TOOL_CALL[TOOL_CALL<br/>0x0400]
-        WASM_INVOKE[WASM_INVOKE<br/>0x0401]
-        INFER[INFER<br/>0x0402]
-    end
-
-    style FS_OPEN fill:#3498db,color:#fff
-    style NET_CONNECT fill:#9b59b6,color:#fff
-    style PROC_SPAWN fill:#e74c3c,color:#fff
-    style TOOL_CALL fill:#f39c12,color:#fff
-```
-
-### Filesystem Effects (0x01xx)
-
-| Effect | Code | Description |
-|--------|------|-------------|
-| `AK_E_FS_OPEN` | 0x0100 | Open file for read/write |
-| `AK_E_FS_UNLINK` | 0x0101 | Delete file |
-| `AK_E_FS_RENAME` | 0x0102 | Rename/move file |
-| `AK_E_FS_MKDIR` | 0x0103 | Create directory |
-
-### Network Effects (0x02xx)
-
-| Effect | Code | Description |
-|--------|------|-------------|
-| `AK_E_NET_CONNECT` | 0x0200 | Establish connection |
-| `AK_E_NET_DNS_RESOLVE` | 0x0201 | DNS lookup |
-| `AK_E_NET_BIND` | 0x0202 | Bind to port |
-| `AK_E_NET_LISTEN` | 0x0203 | Listen for connections |
-
-### Process Effects (0x03xx)
-
-| Effect | Code | Description |
-|--------|------|-------------|
-| `AK_E_PROC_SPAWN` | 0x0300 | Create child agent |
-
-### Agentic Effects (0x04xx)
-
-| Effect | Code | Description |
-|--------|------|-------------|
-| `AK_E_TOOL_CALL` | 0x0400 | Execute tool |
-| `AK_E_WASM_INVOKE` | 0x0401 | Run WASM module |
-| `AK_E_INFER` | 0x0402 | LLM inference |
-
-## Effect Request Structure
+## Capability Types
 
 ```c
-typedef struct ak_effect_req {
-    ak_effect_op_t op;
-    u64 trace_id;
-    pid_t pid;
-    tid_t tid;
-
-    /* Canonical target string:
-     * - FS: absolute normalized path
-     * - NET_CONNECT: "ip:1.2.3.4:443" OR "dns:example.com:443"
-     * - NET_DNS_RESOLVE: "dns:example.com"
-     * - TOOL: "tool:<name>:<version>"
-     * - INFER: "model:<name>:<version>"
-     */
-    char target[512];
-
-    /* Compact encoded params (JSON) */
-    u8 params[4096];
-    u32 params_len;
-
-    /* Budgets/limits */
-    struct {
-        u64 cpu_ns;
-        u64 wall_ns;
-        u64 bytes;
-        u64 tokens;
-    } budget;
-} ak_effect_req_t;
+typedef enum {
+    AK_CAP_NET       = 1,    /* Network access */
+    AK_CAP_FS        = 2,    /* Filesystem access */
+    AK_CAP_TOOL      = 3,    /* Tool execution */
+    AK_CAP_SECRETS   = 4,    /* Secret resolution */
+    AK_CAP_SPAWN     = 5,    /* Child spawning */
+    AK_CAP_HEAP      = 6,    /* Heap object access */
+    AK_CAP_INFERENCE = 7,    /* Outbound request access */
+    AK_CAP_LLM       = 7,    /* Alias for INFERENCE */
+    AK_CAP_IPC       = 8,    /* Inter-process communication */
+    AK_CAP_ANY       = 254,  /* Wildcard - matches any type */
+    AK_CAP_ADMIN     = 255,  /* Administrative (root) */
+} ak_cap_type_t;
 ```
 
-## Authorization Decision
+## Target Canonicalization
 
-```c
-typedef struct ak_decision {
-    boolean allow;
-    int reason_code;
-    int errno_equiv;
-    char missing_cap[64];
-    char suggested_snippet[512];
-    u64 trace_id;
-    char detail[256];
-} ak_decision_t;
-```
-
-## Denial Reasons
-
-| Code | Name | Description |
-|------|------|-------------|
-| 1 | `AK_DENY_NO_POLICY` | No policy loaded |
-| 2 | `AK_DENY_NO_CAP` | Capability required but missing |
-| 3 | `AK_DENY_CAP_EXPIRED` | Capability TTL exceeded |
-| 4 | `AK_DENY_PATTERN_MISMATCH` | Target doesn't match policy pattern |
-| 5 | `AK_DENY_BUDGET_EXCEEDED` | Would exceed resource budget |
-| 6 | `AK_DENY_RATE_LIMITED` | Rate limit exceeded |
-| 7 | `AK_DENY_TAINT` | Taint level too high for sink |
-
-## Canonicalization
+For filesystem and network enforcement, targets are canonicalized before policy matching so that equivalent inputs compare equal.
 
 ```mermaid
 flowchart TB
@@ -220,19 +119,14 @@ flowchart TB
     style DNS_OUT fill:#2ecc71,color:#fff
 ```
 
-All targets are canonicalized before policy matching:
-
 ### Filesystem Paths
 
 1. Convert relative to absolute (using cwd)
 2. Remove `.` segments
-3. Resolve `..` segments
+3. Resolve `..` segments lexically (symlinks not resolved)
 4. No trailing slashes (except root)
 
-**Example:**
-- Input: `./foo/../bar/file.txt`
-- CWD: `/app`
-- Output: `/app/bar/file.txt`
+**Example:** input `./foo/../bar/file.txt`, cwd `/app` → `/app/bar/file.txt`
 
 ### Network Addresses
 
@@ -246,86 +140,42 @@ All targets are canonicalized before policy matching:
 
 ### DNS Targets
 
-Format: `dns:<hostname>`
-
-**Example:**
-- `example.com` → `dns:example.com`
-
-## Effect Flow
-
-```mermaid
-flowchart TD
-    SYSCALL["POSIX Syscall<br/>open('/etc/hosts', O_RDONLY)"]
-    BUILD["Build Effect<br/>AK_E_FS_OPEN, target='/etc/hosts'"]
-    CANON["Canonicalize<br/>Normalize path"]
-    POLICY{"Policy Check<br/>Does fs.read match '/etc/hosts'?"}
-    ALLOW[ALLOW]
-    DENY["DENY<br/>+ reason, suggestion"]
-    EXEC["Execute<br/>Perform actual open()"]
-    AUDIT["Audit<br/>Log entry appended"]
-
-    SYSCALL --> BUILD
-    BUILD --> CANON
-    CANON --> POLICY
-    POLICY -->|Match| ALLOW
-    POLICY -->|No Match| DENY
-    ALLOW --> EXEC
-    EXEC --> AUDIT
-
-    style SYSCALL fill:#3498db,color:#fff
-    style ALLOW fill:#27ae60,color:#fff
-    style DENY fill:#c0392b,color:#fff
-    style AUDIT fill:#2ecc71,color:#fff
-```
-
-## Building Effects from Syscalls
-
-```c
-/* Helper functions */
-int ak_effect_from_open(ak_effect_req_t *req, const char *path, int flags);
-int ak_effect_from_connect(ak_effect_req_t *req, const struct sockaddr *addr, socklen_t len);
-int ak_effect_from_unlink(ak_effect_req_t *req, const char *path);
-```
+Format: `dns:<hostname>`. DNS resolution is authorized separately from connection: a `net.connect` with a `dns:` target requires prior DNS authorization.
 
 ## Policy Matching
 
-```mermaid
-graph TB
-    subgraph "Effect to Policy Mapping"
-        direction LR
-        EFF_FS[AK_E_FS_OPEN<br/>O_RDONLY] --> POL_READ[fs.read patterns]
-        EFF_FSW[AK_E_FS_OPEN<br/>O_WRONLY] --> POL_WRITE[fs.write patterns]
-        EFF_NET[AK_E_NET_CONNECT] --> POL_CONN[net.connect patterns]
-        EFF_DNS[AK_E_NET_DNS_RESOLVE] --> POL_DNS[net.dns patterns]
-        EFF_TOOL[AK_E_TOOL_CALL] --> POL_TOOL[tools.allow patterns]
-        EFF_INFER[AK_E_INFER] --> POL_INFER[infer.models patterns]
-    end
+Once a target is canonicalized, it is matched against the loaded policy's patterns. Pattern matching uses glob-style syntax:
 
-    subgraph "Pattern Matching"
-        TARGET["/app/data/file.txt"]
-
-        P1["Pattern: /app/**"] -->|MATCH| TARGET
-        P2["Pattern: /app/data/*"] -->|MATCH| TARGET
-        P3["Pattern: /tmp/**"] -->|NO MATCH| TARGET
-    end
-
-    style POL_READ fill:#3498db,color:#fff
-    style POL_WRITE fill:#e74c3c,color:#fff
-    style POL_CONN fill:#9b59b6,color:#fff
-```
-
-Effects are matched against policy rules:
+- `*` matches any characters except `/`
+- `**` matches any characters including `/`
+- Exact strings require an exact match
 
 ```json
 {
   "fs": {
-    "read": ["/etc/**"],  // Matches AK_E_FS_OPEN with O_RDONLY
-    "write": ["/tmp/**"]  // Matches AK_E_FS_OPEN with O_WRONLY
+    "read":  ["/etc/**"],
+    "write": ["/tmp/**"]
+  },
+  "net": {
+    "connect": ["ip:10.0.0.0/8:*"],
+    "dns":     ["*.example.com"]
   }
 }
 ```
 
-Pattern matching uses glob-style syntax:
-- `*` matches any characters except `/`
-- `**` matches any characters including `/`
-- Exact strings require exact match
+A request is admitted only when a capability subsumes its type/resource/method **and** a policy rule matches its canonical target **and** the operation fits within the hard budget. Any failure is denied and logged.
+
+---
+
+## Appendix: Legacy Effect Opcodes (not compiled)
+
+The following `AK_E_*` opcodes were defined in the uncompiled `ak_effects.c` layer. They are **not** part of the runtime enforcement path and are listed only for historical context.
+
+| Effect | Code | Notes |
+|--------|------|-------|
+| `AK_E_FS_OPEN` | 0x0100 | Legacy — superseded by POSIX routing + heap/FS capabilities |
+| `AK_E_FS_UNLINK` | 0x0101 | Legacy |
+| `AK_E_NET_CONNECT` | 0x0200 | Legacy — network enforcement lives in `ak_net_enforce.c` |
+| `AK_E_NET_DNS_RESOLVE` | 0x0201 | Legacy |
+| `AK_E_TOOL_CALL` | 0x0400 | Legacy — replaced by `AK_SYS_CALL` handler |
+| `AK_E_INFER` | 0x0402 | Legacy — replaced by `AK_SYS_INFERENCE` / `INFER_ISSUE` |

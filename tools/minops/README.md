@@ -4,7 +4,7 @@ A lightweight Go tool that replaces the external `ops` tool for running kernel e
 
 ## Features
 
-- ✅ Runs Python applications inside Authority Nanos unikernel
+- ✅ Runs Python applications inside Authority unikernel
 - ✅ No external dependencies (ops tool not required)
 - ✅ Integrated image creation using mkfs
 - ✅ QEMU auto-detection and launch
@@ -66,7 +66,7 @@ Supported fields:
 
 ## Requirements
 
-- Authority Nanos kernel built: `output/platform/pc/bin/kernel.img`
+- Authority kernel built: `output/platform/pc/bin/kernel.img`
 - mkfs tool built: `output/tools/bin/mkfs`
 - QEMU: `qemu-system-x86_64` (for running kernel examples)
 - Go 1.18+ (for building minops)

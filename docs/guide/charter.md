@@ -2,15 +2,15 @@
 
 ## Mission
 
-Authority Nanos is a security kernel for autonomous agents, enabling safe, auditable execution of AI agents in production environments.
+Authority is a capability-based security unikernel, built on Nanos, that runs a single untrusted program per VM and enforces kernel-level security on every effect that program performs.
 
 ## Tenets
 
-These tenets guide Authority Nanos' development:
+These tenets guide Authority's development:
 
 ### 1. Security
 
-Authority Nanos aims to be a much more secure system than Linux. It achieves this through several approaches:
+Authority aims to be a much more secure system than Linux. It achieves this through several approaches:
 
 - **Unikernel architecture** - Single-process design eliminates multi-user complexity and privilege escalation vectors
 - **Minimal kernel** - Reduces attack surface by limiting code
@@ -19,7 +19,7 @@ Authority Nanos aims to be a much more secure system than Linux. It achieves thi
 
 ### 2. Minimalism (KISS)
 
-Keep It Simple, Stupid. As Authority Nanos is not intended to run on bare metal, we strive to keep the core as simple as possible while maintaining security guarantees.
+Keep It Simple, Stupid. As Authority is not intended to run on bare metal, we strive to keep the core as simple as possible while maintaining security guarantees.
 
 ### 3. Performance
 

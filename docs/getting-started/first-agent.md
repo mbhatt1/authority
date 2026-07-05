@@ -1,54 +1,50 @@
-# Building Your First Agent
+# Building Your First Program
 
-This guide walks you through creating a simple AI agent that runs on Authority Nanos.
+This guide walks you through building a simple program and running it as a single untrusted workload on Authority, under a deny-by-default policy.
 
-## Agent Architecture
+## Program Architecture
 
 ```mermaid
 graph TB
-    subgraph "Your AI Agent"
-        CODE[Application Code<br/>Go/Rust/Python]
+    subgraph "Your Program"
+        CODE[Application Code<br/>Go/Rust/C]
         POLICY[Policy File<br/>policy.json]
         CONFIG[Configuration<br/>config.json]
     end
 
-    subgraph "Authority Nanos Runtime"
-        GATE[Authority Gate]
+    subgraph "Authority Runtime"
+        GATE[ak_syscall_handler → ak_dispatch]
         EXEC[Effect Executor]
         AUDIT[Audit Log]
     end
 
     subgraph "External Services"
-        LLM[LLM APIs<br/>OpenAI/Anthropic]
-        API[Other APIs<br/>GitHub, etc.]
+        API[Outbound Endpoints<br/>HTTPS APIs]
     end
 
     CODE --> GATE
     POLICY --> GATE
     GATE --> EXEC
     EXEC --> AUDIT
-    EXEC --> LLM
     EXEC --> API
-
-    style GATE fill:#e74c3c,color:#fff
-    style POLICY fill:#3498db,color:#fff
-    style AUDIT fill:#2ecc71,color:#fff
 ```
 
 ## Overview
 
-An AI agent on Authority Nanos consists of:
+A program on Authority consists of:
 
-1. **Application code** - Your agent logic (Go, Rust, Python, etc.)
-2. **Policy file** - Defines what the agent can do
-3. **Configuration** - Runtime settings including LLM configuration
+1. **Application code** — your workload logic (Go, Rust, C, etc.)
+2. **Policy file** — declares what the program is allowed to do
+3. **Configuration** — runtime settings and initrd layout
 
-## Step 1: Create the Agent Code
+Every effect the program performs enters through `ak_syscall_handler`, which calls `ak_dispatch()`. Requests are validated, checked for replay, authorized against an HMAC-SHA256 capability, checked against policy and budget, executed, and appended to the hash-chained audit log — in that order.
 
-Here's a simple agent in Go that makes API calls:
+## Step 1: Create the Program
+
+Here's a simple program in Go that makes an outbound API call:
 
 ```go
-// agent.go
+// program.go
 package main
 
 import (
@@ -58,7 +54,7 @@ import (
 )
 
 func main() {
-    // Make an allowed API call
+    // Make an allowed outbound request
     resp, err := http.Get("https://api.github.com/users/nanovms")
     if err != nil {
         fmt.Printf("Error: %v\n", err)
@@ -74,7 +70,7 @@ func main() {
 Build it:
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o agent agent.go
+GOOS=linux GOARCH=amd64 go build -o program program.go
 ```
 
 ## Step 2: Create the Policy
@@ -124,90 +120,49 @@ mkdir -p ak
 cp policy.json ak/policy.json
 ```
 
-## Step 4: Run the Agent
+## Step 4: Run the Program
 
 ```bash
-authority run -c config.json agent
+authority run -c config.json program
 ```
 
-You should see the GitHub API response. If you try to access a different domain, it will be denied:
+You should see the GitHub API response. If the program tries to reach a different host, it is denied before the connection is made:
 
 ```
 AK DENY NET_CONNECT dns:evil.com:443 missing net.connect. Fix: connect = ["dns:evil.com:443"]
 ```
 
-## Adding LLM Support
+## Adding Outbound Requests
+
+Beyond ordinary network syscalls, Authority provides a dedicated **outbound-request handler** for gated external calls. It uses an asynchronous issue/poll model so the kernel never blocks in-kernel on external I/O:
 
 ```mermaid
-graph LR
-    subgraph "Agent"
-        INFER[Inference Request]
-    end
+sequenceDiagram
+    participant Prog as Program
+    participant Disp as ak_dispatch
+    participant Run as Kernel Runloop
 
-    subgraph "LLM Gateway"
-        ROUTE{Route Type?}
-    end
-
-    subgraph "Local"
-        OLLAMA[Ollama<br/>virtio-serial]
-        VLLM[vLLM<br/>virtio-serial]
-    end
-
-    subgraph "Remote"
-        OPENAI[OpenAI API<br/>HTTPS]
-        ANTHROPIC[Anthropic API<br/>HTTPS]
-    end
-
-    INFER --> ROUTE
-    ROUTE -->|Local| OLLAMA
-    ROUTE -->|Local| VLLM
-    ROUTE -->|Remote| OPENAI
-    ROUTE -->|Remote| ANTHROPIC
-
-    style ROUTE fill:#f39c12,color:#fff
-    style OLLAMA fill:#3498db,color:#fff
-    style OPENAI fill:#9b59b6,color:#fff
+    Prog->>Disp: AK_SYS_INFER_ISSUE (request)
+    Disp->>Disp: Validate, capability, policy, budget
+    Disp->>Run: ak_https_issue (queued)
+    Disp-->>Prog: request id
+    Run->>Run: ak_https_poll performs I/O
+    Prog->>Disp: AK_SYS_INFER_POLL (request id)
+    Disp-->>Prog: result (when ready)
 ```
 
-To add LLM capabilities to your agent:
+- Enforcement (validation, capability, policy, budget) happens **synchronously on issue**.
+- The actual network I/O runs on the kernel runloop.
+- The program polls for the result with `AK_SYS_INFER_POLL`.
 
-### Local Model (Ollama)
-
-Start Ollama on the host:
-
-```bash
-ollama serve
-```
-
-Update your policy:
-
-```json
-{
-  "version": "1.0",
-  "infer": {
-    "models": ["llama3.1:*", "codellama:*"],
-    "max_tokens": 100000
-  },
-  "budgets": {
-    "tokens": 100000
-  }
-}
-```
-
-### External API (OpenAI/Anthropic)
-
-Update your policy:
+Because outbound requests reach external hosts, they still require the corresponding `net.dns` and `net.connect` policy rules, and they consume the `tokens` budget when the response reports token counts:
 
 ```json
 {
   "version": "1.0",
   "net": {
-    "dns": ["api.openai.com", "api.anthropic.com"],
-    "connect": ["dns:api.openai.com:443", "dns:api.anthropic.com:443"]
-  },
-  "infer": {
-    "models": ["gpt-4", "claude-*"],
-    "max_tokens": 100000
+    "dns": ["api.example.com"],
+    "connect": ["dns:api.example.com:443"]
   },
   "budgets": {
     "tokens": 100000
@@ -217,13 +172,14 @@ Update your policy:
 
 ## Adding Tool Support
 
+Tools run in an **integer-only WASM sandbox**. The kernel is built `-mno-sse`, so tools that use floating-point are rejected. Each tool call is gated by policy and counted against the tool-call budget.
+
 ```mermaid
 graph TB
     subgraph "Allowed Tools"
         HTTP_GET[http_get]
         HTTP_POST[http_post]
         FILE_READ[file_read]
-        WEB_SEARCH[web_search]
     end
 
     subgraph "Denied Tools"
@@ -235,26 +191,19 @@ graph TB
         BUDGET[Budget: 50 calls]
     end
 
-    AGENT[Agent] --> HTTP_GET
-    AGENT --> HTTP_POST
-    AGENT --> FILE_READ
-    AGENT --> WEB_SEARCH
+    PROG[Program] --> HTTP_GET
+    PROG --> HTTP_POST
+    PROG --> FILE_READ
 
-    AGENT -.->|BLOCKED| SHELL
-    AGENT -.->|BLOCKED| FILE_DEL
+    PROG -.->|BLOCKED| SHELL
+    PROG -.->|BLOCKED| FILE_DEL
 
     HTTP_GET --> BUDGET
     HTTP_POST --> BUDGET
     FILE_READ --> BUDGET
-    WEB_SEARCH --> BUDGET
-
-    style SHELL fill:#c0392b,color:#fff
-    style FILE_DEL fill:#c0392b,color:#fff
-    style HTTP_GET fill:#27ae60,color:#fff
-    style BUDGET fill:#f39c12,color:#fff
 ```
 
-To allow your agent to use tools:
+To allow your program to use tools:
 
 ```json
 {
@@ -263,8 +212,7 @@ To allow your agent to use tools:
     "allow": [
       "http_get",
       "http_post",
-      "file_read",
-      "web_search"
+      "file_read"
     ],
     "deny": [
       "shell_exec",
@@ -279,7 +227,7 @@ To allow your agent to use tools:
 
 ## Complete Example
 
-Here's a complete policy for a typical AI agent:
+A complete policy for a program that makes outbound requests, calls sandboxed tools, and runs under hard budgets:
 
 ```json
 {
@@ -289,20 +237,15 @@ Here's a complete policy for a typical AI agent:
     "write": ["/app/workspace/**", "/tmp/**"]
   },
   "net": {
-    "dns": ["api.openai.com", "api.anthropic.com", "api.github.com"],
+    "dns": ["api.example.com", "api.github.com"],
     "connect": [
-      "dns:api.openai.com:443",
-      "dns:api.anthropic.com:443",
+      "dns:api.example.com:443",
       "dns:api.github.com:443"
     ]
   },
   "tools": {
-    "allow": ["http_get", "file_read", "file_write", "web_search"],
+    "allow": ["http_get", "file_read", "file_write"],
     "deny": ["shell_exec"]
-  },
-  "infer": {
-    "models": ["gpt-4", "claude-*"],
-    "max_tokens": 100000
   },
   "budgets": {
     "tool_calls": 100,
@@ -317,4 +260,4 @@ Here's a complete policy for a typical AI agent:
 
 - [Policy Reference](/policy/) - All policy options
 - [Security Invariants](/security/invariants) - Understanding the guarantees
-- [API Reference](/api/) - Authority Kernel syscalls
+- [API Reference](/api/) - Authority kernel syscalls

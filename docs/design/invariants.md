@@ -1,24 +1,24 @@
 # Security Invariants
 
-The Authority Kernel enforces **four mathematical security invariants**. These are not guidelines or best practices - they are cryptographic and architectural guarantees.
+The Authority kernel enforces **four security invariants**. These are not guidelines or best practices - they are cryptographic and architectural guarantees, all enforced in `ak_dispatch()` (`src/agentic/ak_syscall.c`).
 
 ---
 
 ## INV-1: No-Bypass Invariant
 
-**Statement:** All external effects occur through kernel-mediated syscalls.
+**Statement:** The program reaches external effects only through the Authority syscalls (1024+).
 
 ```
-For all agents A, for all IO operations O:
-    O is external => O passes through kernel syscall interface
+For all IO operations O by the program:
+    O is external => O passes through ak_dispatch()
 ```
 
 ### Enforcement
 
+- The program is the single workload in the VM (one address space, no other processes)
 - Unikernel architecture eliminates bypass vectors
-- No raw sockets, no direct hardware access
-- No process escape
-- All FS/NET operations routed through AK effects
+- No raw device access
+- Every Authority syscall is routed through `ak_dispatch()`
 
 ### Verification
 
@@ -74,12 +74,15 @@ For all operations O with cost c:
 
 ### Budget Dimensions
 
-- LLM tokens (input/output)
+- Outbound request units (tokens)
 - Tool calls
-- Wall time (ms)
-- Heap objects
+- Outbound request time (ms)
+- Heap objects / heap bytes
 - File I/O (bytes)
 - Network I/O (bytes)
+- Spawned children
+
+Budget accounting is hard, atomic, and overflow-safe.
 
 ### Admission Control
 
@@ -120,7 +123,7 @@ Entry[n]: prev_hash = Entry[n-1].this_hash
 
 - **Append-only**: No deletions, no modifications
 - **Tamper-evident**: Broken chain detected immediately
-- **Non-repudiation**: Request hash proves agent action
+- **Non-repudiation**: Request hash proves the program's action
 
 ### Verification
 
@@ -137,7 +140,7 @@ Walks the chain from Entry[from_seq] to Entry[to_seq], computing hashes and veri
 ```c
 struct ak_audit_entry {
     u64 seq;                  // Monotonic sequence number
-    u8 pid[16];               // Agent ID
+    u8 pid[16];               // Program/context ID
     u8 run_id[16];            // Execution ID
     u16 op;                   // Operation code
     u64 timestamp_ns;         // Nanosecond timestamp
@@ -170,8 +173,8 @@ An anchor at sequence N certifies all entries from the previous anchor to N.
 
 | Invariant | Enforcement Point | Function |
 |-----------|-------------------|----------|
-| INV-1 | Syscall dispatcher | `ak_syscall_handler()` |
-| INV-2 | Authorization gate | `ak_authorize_and_execute()` |
+| INV-1 | Syscall dispatcher | `ak_dispatch()` |
+| INV-2 | Capability stage of dispatch | `ak_validate_capability()` |
 | INV-3 | Admission control | `ak_budget_reserve()` |
 | INV-4 | Audit append | `ak_audit_append()` |
 
@@ -201,7 +204,7 @@ An anchor at sequence N certifies all entries from the previous anchor to N.
 - Deny-by-default with missing policy
 - Allow operations with valid policy
 - Budget exhaustion prevents operation
-- Audit log integrity across agent restarts
+- Audit log integrity across program restarts
 
 ### Security Tests
 
@@ -216,7 +219,7 @@ An anchor at sequence N certifies all entries from the previous anchor to N.
 
 If an invariant violation is detected:
 
-1. **Halt agent execution** - Stop processing immediately
+1. **Halt the program** - Stop processing immediately
 2. **Revoke all active capabilities** - Prevent further operations
 3. **Preserve audit log** - Keep log for forensics
 4. **Patch and verify** - Fix the issue and test thoroughly before restart

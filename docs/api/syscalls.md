@@ -1,6 +1,6 @@
 # Syscalls Reference
 
-Detailed documentation for Authority Kernel syscalls.
+Detailed documentation for Authority Kernel syscalls. Every call is routed through `ak_syscall_handler()` into the `ak_dispatch()` pipeline before any effect executes.
 
 ## Syscall Categories Overview
 
@@ -13,32 +13,29 @@ graph LR
         DELETE[DELETE<br/>1027]
     end
 
-    subgraph "Tools (1028-1029)"
-        CALL[CALL<br/>1028]
+    subgraph "Audit / Batch"
+        QUERY[QUERY<br/>1028]
         BATCH[BATCH<br/>1029]
+        COMMIT[COMMIT<br/>1030]
     end
 
-    subgraph "Audit (1030-1031)"
-        COMMIT[COMMIT<br/>1030]
-        QUERY[QUERY<br/>1031]
+    subgraph "Tools"
+        CALL[CALL<br/>1031]
     end
 
     subgraph "Control (1032-1036)"
         SPAWN[SPAWN<br/>1032]
         SEND[SEND<br/>1033]
         RECV[RECV<br/>1034]
-        ASSERT[ASSERT<br/>1035]
-        RESPOND[RESPOND<br/>1036]
+        RESPOND[RESPOND<br/>1035]
+        ASSERT[ASSERT<br/>1036]
     end
 
-    subgraph "Cognitive (1037)"
+    subgraph "Outbound / Budget (1037-1042)"
         INFER[INFERENCE<br/>1037]
-    end
-
-    subgraph "Deny UX (1040-1042)"
-        LAST[LAST_ERROR<br/>1040]
-        TRACE[TRACE_RING<br/>1041]
-        SUGGEST[POLICY_SUGGEST<br/>1042]
+        BUD[BUDGET_*<br/>1038-1040]
+        ISSUE[INFER_ISSUE<br/>1041]
+        POLL[INFER_POLL<br/>1042]
     end
 
     style READ fill:#3498db,color:#fff
@@ -46,7 +43,6 @@ graph LR
     style COMMIT fill:#2ecc71,color:#fff
     style SPAWN fill:#e74c3c,color:#fff
     style INFER fill:#f39c12,color:#fff
-    style LAST fill:#1abc9c,color:#fff
 ```
 
 ## State Management
@@ -89,7 +85,6 @@ Read a heap object by pointer.
   "ok": true,
   "result": {
     "ptr": 12345,
-    "type": "AgentState",
     "version": 5,
     "value": { ... },
     "taint": 0
@@ -98,21 +93,21 @@ Read a heap object by pointer.
 ```
 
 **Errors:**
-- `ENOENT` - Object not found
-- `E_CAP_SCOPE` - Capability doesn't cover this object
+- `ENOENT` — Object not found
+- `E_CAP_SCOPE` — Capability doesn't cover this object
 
 ### AK_SYS_ALLOC (1025)
 
-Allocate a new heap object.
+Allocate a new typed heap object.
 
 **Request:**
 ```json
 {
   "op": "ALLOC",
   "args": {
-    "type": "AgentState",
+    "type": "State",
     "value": {
-      "name": "my-agent",
+      "name": "worker",
       "status": "running"
     }
   }
@@ -131,8 +126,8 @@ Allocate a new heap object.
 ```
 
 **Errors:**
-- `E_SCHEMA_INVALID` - Value doesn't match type schema
-- `E_BUDGET_EXCEEDED` - Heap object limit reached
+- `E_SCHEMA_INVALID` — Value doesn't match type schema
+- `E_BUDGET_EXCEEDED` — Heap object limit reached
 
 ### AK_SYS_WRITE (1026)
 
@@ -163,9 +158,9 @@ Update an existing object with CAS semantics.
 ```
 
 **Errors:**
-- `E_CONFLICT` - Version mismatch (retry required)
-- `E_SCHEMA_INVALID` - Patched value invalid
-- `ENOENT` - Object not found
+- `E_CONFLICT` — Version mismatch (retry required)
+- `E_SCHEMA_INVALID` — Patched value invalid
+- `ENOENT` — Object not found
 
 ### AK_SYS_DELETE (1027)
 
@@ -192,58 +187,20 @@ Soft-delete an object (sets tombstone flag).
 }
 ```
 
-## Tools
+## Audit and Query
 
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant Gate as Authority Gate
-    participant Policy as Policy Engine
-    participant WASM as WASM Sandbox
-    participant Tool as Tool Function
-    participant Audit
+### AK_SYS_QUERY (1028)
 
-    Agent->>Gate: CALL(tool, params, cap)
-    Gate->>Gate: Verify capability
-
-    Gate->>Policy: Check tool allowed?
-    Policy-->>Gate: Allow/Deny
-
-    alt Tool Allowed
-        Gate->>WASM: Load sandbox
-        WASM->>Tool: Execute function
-        Tool->>Tool: Process request
-
-        alt Tool needs network
-            Tool->>Gate: Network effect
-            Gate->>Policy: Check network policy
-        end
-
-        Tool-->>WASM: Result
-        WASM-->>Gate: Sandboxed result
-        Gate->>Audit: Log execution
-        Gate-->>Agent: Success + usage
-    else Tool Denied
-        Gate->>Audit: Log denial
-        Gate-->>Agent: E_POLICY_DENY
-    end
-```
-
-### AK_SYS_CALL (1028)
-
-Execute a tool in the WASM sandbox.
+Query the audit log.
 
 **Request:**
 ```json
 {
-  "op": "CALL",
+  "op": "QUERY",
   "args": {
-    "tool": "http_get",
-    "params": {
-      "url": "https://api.github.com/users/nanovms"
-    }
-  },
-  "cap": { ... }
+    "start_seq": 0,
+    "end_seq": 100
+  }
 }
 ```
 
@@ -252,21 +209,44 @@ Execute a tool in the WASM sandbox.
 {
   "ok": true,
   "result": {
-    "status": 200,
-    "body": { ... }
-  },
-  "usage": {
-    "cpu_ns": 1500000,
-    "network_bytes": 4096
+    "entries": [
+      {
+        "seq": 1,
+        "op": "ALLOC",
+        "req_hash": "...",
+        "res_hash": "...",
+        "this_hash": "..."
+      }
+    ],
+    "head_seq": 1,
+    "count": 1
   }
 }
 ```
 
-**Errors:**
-- `E_POLICY_DENY` - Tool not allowed by policy
-- `E_CAP_SCOPE` - Capability doesn't cover this tool
-- `E_TOOL_FAIL` - Tool execution failed
-- `E_BUDGET_EXCEEDED` - Tool call budget exhausted
+### AK_SYS_COMMIT (1030)
+
+Force an immediate audit log commit (fsync). Note: the dispatcher already makes each entry durable before returning; `COMMIT` is an explicit flush point.
+
+**Request:**
+```json
+{
+  "op": "COMMIT"
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "result": {
+    "seq": 1234,
+    "hash": "abc123..."
+  }
+}
+```
+
+## Batch
 
 ### AK_SYS_BATCH (1029)
 
@@ -299,124 +279,111 @@ Execute multiple operations atomically.
 ```
 
 **Errors:**
-- `E_CONFLICT` - Any operation version mismatch (all rolled back)
+- `E_CONFLICT` — Any operation version mismatch (all rolled back)
 
-## Audit
+## Tools
 
-### AK_SYS_COMMIT (1030)
-
-Force immediate log commit (fsync).
-
-**Request:**
-```json
-{
-  "op": "COMMIT"
-}
-```
-
-**Response:**
-```json
-{
-  "ok": true,
-  "result": {
-    "seq": 1234,
-    "hash": "abc123..."
-  }
-}
-```
-
-### AK_SYS_QUERY (1031)
-
-Query the audit log.
-
-**Request:**
-```json
-{
-  "op": "QUERY",
-  "args": {
-    "run_id": "2024-01-15T10:30:00Z",
-    "from_seq": 0,
-    "to_seq": 100
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "ok": true,
-  "result": {
-    "entries": [
-      {
-        "seq": 1,
-        "op": "ALLOC",
-        "req_hash": "...",
-        "res_hash": "...",
-        "this_hash": "..."
-      }
-    ]
-  }
-}
-```
-
-## Cognitive
+Tools run in an **integer-only WASM subset interpreter** (`ak_wasm_interp.c`). The kernel is built `-mno-sse`, so float value types and opcodes are rejected fail-closed. Tool execution is gated by the same dispatch pipeline as every other syscall.
 
 ```mermaid
-graph TB
-    subgraph "Inference Request"
-        REQ[Agent Request]
-        MODEL[Model Selection]
-        TOKENS[Token Budget Check]
+sequenceDiagram
+    participant App as Program
+    participant Dispatch as ak_dispatch
+    participant Policy as Policy
+    participant WASM as WASM Interpreter
+    participant Tool as Tool Module
+    participant Audit
+
+    App->>Dispatch: CALL(tool, params) + cap
+    Dispatch->>Dispatch: Capability check (INV-2)
+    Dispatch->>Policy: Tool allowed?
+    Policy-->>Dispatch: Allow/Deny
+
+    alt Tool Allowed
+        Dispatch->>WASM: Load module (integer-only)
+        WASM->>Tool: Execute function
+        Tool-->>WASM: Result
+        WASM-->>Dispatch: Result
+        Dispatch->>Audit: Log (durable)
+        Dispatch-->>App: Success + usage
+    else Denied
+        Dispatch->>Audit: Log denial (durable)
+        Dispatch-->>App: E_POLICY_DENY
     end
-
-    subgraph "LLM Gateway"
-        ROUTE{Route Type?}
-        LOCAL[Local Model<br/>Ollama/vLLM]
-        REMOTE[Remote API<br/>OpenAI/Anthropic]
-    end
-
-    subgraph "Response"
-        RESULT[LLM Response]
-        USAGE[Token Usage]
-        AUDIT[Audit Log]
-    end
-
-    REQ --> MODEL
-    MODEL --> TOKENS
-    TOKENS --> ROUTE
-
-    ROUTE -->|Local| LOCAL
-    ROUTE -->|Remote| REMOTE
-
-    LOCAL --> RESULT
-    REMOTE --> RESULT
-
-    RESULT --> USAGE
-    USAGE --> AUDIT
-
-    style ROUTE fill:#f39c12,color:#fff
-    style LOCAL fill:#3498db,color:#fff
-    style REMOTE fill:#9b59b6,color:#fff
 ```
+
+### AK_SYS_CALL (1031)
+
+Execute a tool in the integer-only WASM interpreter.
+
+**Request:**
+```json
+{
+  "op": "CALL",
+  "args": {
+    "tool": "parse_record",
+    "params": {
+      "input": "..."
+    }
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "result": {
+    "output": { ... }
+  },
+  "usage": {
+    "cpu_ns": 1500000
+  }
+}
+```
+
+**Errors:**
+- `E_POLICY_DENY` — Tool not allowed by policy
+- `E_CAP_SCOPE` — Capability doesn't cover this tool
+- `E_TOOL_FAIL` — Tool execution failed
+- `E_WASM_UNSUPPORTED` — Module uses float or unsupported opcodes (rejected fail-closed)
+- `E_BUDGET_EXCEEDED` — Tool call budget exhausted
+
+## Control
+
+### AK_SYS_SPAWN (1032)
+
+Create a confined child workload. The child holds only the capabilities delegated to it (attenuation); it never receives the root capability.
+
+### AK_SYS_SEND (1033) / AK_SYS_RECV (1034)
+
+Send and receive typed IPC messages. `RECV` dequeues only from the caller's own inbox. Both require an `AK_CAP_IPC` capability.
+
+### AK_SYS_RESPOND (1035)
+
+Send a response to the outside (DLP applied to the payload).
+
+### AK_SYS_ASSERT (1036)
+
+Assert a predicate; halts the workload on failure.
+
+## Outbound Requests
+
+External network access is capability-gated. `AK_SYS_INFERENCE` is the synchronous-enforcement outbound request handler; for network I/O, the async issue/poll pair is used so the kernel never blocks a thread on the network.
 
 ### AK_SYS_INFERENCE (1037)
 
-Call the LLM gateway.
+Submit a capability-gated outbound request. Requires an `AK_CAP_INFERENCE` (alias `AK_CAP_LLM`) capability whose resource pattern covers the destination.
 
 **Request:**
 ```json
 {
   "op": "INFERENCE",
   "args": {
-    "type": "chat",
-    "model": "claude-3-5-sonnet",
-    "messages": [
-      { "role": "user", "content": "Hello!" }
-    ],
-    "max_tokens": 1000,
-    "temperature": 0.7
-  },
-  "cap": { ... }
+    "endpoint": "https://api.example.com/v1/complete",
+    "method": "POST",
+    "body": { ... }
+  }
 }
 ```
 
@@ -425,62 +392,93 @@ Call the LLM gateway.
 {
   "ok": true,
   "result": {
-    "content": "Hello! How can I help you today?",
-    "model": "claude-3-5-sonnet",
-    "finish_reason": "stop"
+    "status": 200,
+    "body": { ... }
   },
   "usage": {
-    "input_tokens": 10,
-    "output_tokens": 15,
+    "bytes": 512,
     "latency_ms": 450
   }
 }
 ```
 
 **Errors:**
-- `E_POLICY_DENY` - Model not allowed
-- `E_CAP_SCOPE` - Inference capability missing
-- `E_BUDGET_EXCEEDED` - Token budget exhausted
+- `E_POLICY_DENY` — Destination not allowed
+- `E_CAP_SCOPE` — Outbound-request capability missing or out of scope
+- `E_BUDGET_EXCEEDED` — Budget exhausted
 
-## Deny UX
+### AK_SYS_INFER_ISSUE (1041) / AK_SYS_INFER_POLL (1042)
+
+Async outbound HTTP(S). The kernel enforces the full pipeline on **issue**, hands the request to the runloop, and the program **polls** for the result. One request may be in flight per context.
 
 ```mermaid
 sequenceDiagram
-    participant Agent
-    participant Gate as Authority Gate
-    participant Policy
-    participant LastErr as Last Error Buffer
-    participant Suggest as Suggestion Engine
+    participant App as Program
+    participant Dispatch as ak_dispatch
+    participant Runloop as Nanos Runloop
+    participant Net as Network
 
-    Agent->>Gate: open("/etc/secret")
-    Gate->>Policy: Check fs.read
-    Policy-->>Gate: DENY (no match)
+    App->>Dispatch: INFER_ISSUE(endpoint) + cap
+    Dispatch->>Dispatch: Enforce pipeline (cap, policy, budget)
+    Dispatch->>Runloop: Hand off request
+    Dispatch-->>App: Accepted
 
-    Gate->>LastErr: Store denial details
-    Note over LastErr: op, target, error_code<br/>missing_cap, trace_id
+    Runloop->>Net: HTTP(S) request (async)
 
-    Gate->>Suggest: Add suggestion
-    Note over Suggest: read = ["/etc/secret"]
+    loop Until complete
+        App->>Dispatch: INFER_POLL
+        Dispatch-->>App: -EAGAIN
+    end
 
-    Gate-->>Agent: -EACCES
-
-    Agent->>Gate: LAST_ERROR
-    Gate->>LastErr: Read stored denial
-    LastErr-->>Agent: JSON with details + fix
-
-    Agent->>Gate: POLICY_SUGGEST
-    Gate->>Suggest: Get all suggestions
-    Suggest-->>Agent: Accumulated fixes
+    Net-->>Runloop: Response
+    App->>Dispatch: INFER_POLL
+    Dispatch-->>App: Result
 ```
 
-### AK_SYS_LAST_ERROR (1040)
+**Issue request:**
+```json
+{
+  "op": "INFER_ISSUE",
+  "args": {
+    "endpoint": "https://api.example.com/v1/complete",
+    "method": "POST",
+    "body": { ... }
+  }
+}
+```
 
-Get details of the last denial.
+**Poll request:**
+```json
+{
+  "op": "INFER_POLL"
+}
+```
+
+**Poll response (pending):** returns `-EAGAIN` until the runloop has driven the request to completion.
+
+**Poll response (ready):**
+```json
+{
+  "ok": true,
+  "result": {
+    "status": 200,
+    "body": { ... }
+  }
+}
+```
+
+## Budget Introspection
+
+Read-only views over the hard budget tracked by the kernel.
+
+### AK_SYS_BUDGET_STATUS (1038)
+
+Current budget status.
 
 **Request:**
 ```json
 {
-  "op": "LAST_ERROR"
+  "op": "BUDGET_STATUS"
 }
 ```
 
@@ -489,42 +487,18 @@ Get details of the last denial.
 {
   "ok": true,
   "result": {
-    "op": "FS_OPEN",
-    "target": "/etc/secret",
-    "error_code": -4201,
-    "missing_cap": "fs.read",
-    "suggested_fix": "read = [\"/etc/secret\"]",
-    "trace_id": "0x1234567890"
+    "limit": 1000000,
+    "used": 42315,
+    "in_flight": 0,
+    "remaining": 957685
   }
 }
 ```
 
-### AK_SYS_POLICY_SUGGEST (1042)
+### AK_SYS_BUDGET_HISTORY (1039)
 
-Get accumulated policy suggestions (when in RECORD mode).
+Historical budget snapshots.
 
-**Request:**
-```json
-{
-  "op": "POLICY_SUGGEST"
-}
-```
+### AK_SYS_BUDGET_BREAKDOWN (1040)
 
-**Response:**
-```json
-{
-  "ok": true,
-  "result": {
-    "suggestions": [
-      {
-        "section": "fs.read",
-        "pattern": "/etc/hosts"
-      },
-      {
-        "section": "net.dns",
-        "pattern": "api.example.com"
-      }
-    ]
-  }
-}
-```
+Detailed per-category budget breakdown.

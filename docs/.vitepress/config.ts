@@ -2,9 +2,9 @@ import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
 export default withMermaid(defineConfig({
-  title: 'Authority Nanos',
-  titleTemplate: ':title | Authority Nanos',
-  description: 'Security kernel for autonomous agents - capability-based access control, audit logging, and resource budgets',
+  title: 'Authority',
+  titleTemplate: ':title | Authority',
+  description: 'Capability-based security unikernel: cryptographic capabilities, tamper-evident audit, and resource budgets',
   lang: 'en-US',
 
   head: [
@@ -14,13 +14,13 @@ export default withMermaid(defineConfig({
     ['meta', { name: 'theme-color', content: '#dc2626' }],
 
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:title', content: 'Authority Nanos' }],
-    ['meta', { property: 'og:description', content: 'Security kernel for autonomous agents' }],
+    ['meta', { property: 'og:title', content: 'Authority' }],
+    ['meta', { property: 'og:description', content: 'Capability-based security unikernel' }],
     ['meta', { property: 'og:url', content: 'https://authority-nanos.dev' }],
 
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-    ['meta', { name: 'twitter:title', content: 'Authority Nanos' }],
-    ['meta', { name: 'twitter:description', content: 'Security kernel for autonomous agents' }],
+    ['meta', { name: 'twitter:title', content: 'Authority' }],
+    ['meta', { name: 'twitter:description', content: 'Capability-based security unikernel' }],
   ],
 
   markdown: {
@@ -37,7 +37,7 @@ export default withMermaid(defineConfig({
 
   themeConfig: {
     logo: '/logo.svg',
-    siteTitle: 'Authority Nanos',
+    siteTitle: 'Authority',
 
     nav: [
       { text: 'Home', link: '/' },
@@ -46,7 +46,7 @@ export default withMermaid(defineConfig({
         items: [
           { text: 'Overview', link: '/getting-started/' },
           { text: 'Installation', link: '/getting-started/installation' },
-          { text: 'First Agent', link: '/getting-started/first-agent' }
+          { text: 'First Program', link: '/getting-started/first-agent' }
         ]
       },
       {
@@ -95,7 +95,7 @@ export default withMermaid(defineConfig({
           items: [
             { text: 'Quick Start', link: '/getting-started/' },
             { text: 'Installation', link: '/getting-started/installation' },
-            { text: 'First Agent', link: '/getting-started/first-agent' }
+            { text: 'First Program', link: '/getting-started/first-agent' }
           ]
         }
       ],
@@ -131,7 +131,7 @@ export default withMermaid(defineConfig({
             { text: 'Roadmap', link: '/design/ak-roadmap' },
             { text: 'Security Invariants', link: '/design/invariants' },
             { text: 'Threat Model', link: '/design/ak-threat-model' },
-            { text: 'Agentic Kernel', link: '/design/agentic-kernel' },
+            { text: 'Authority Kernel', link: '/design/agentic-kernel' },
             { text: 'Bug Checklist', link: '/design/bug-checklist' }
           ]
         }

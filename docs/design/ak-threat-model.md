@@ -8,29 +8,29 @@
 
 ## 1. Overview
 
-This document defines the threat model for the Authority Kernel (AK) deny-by-default security system.
+This document defines the threat model for the Authority kernel (AK) deny-by-default security system. Authority runs a **single untrusted program** per VM; the goal is to sandbox that program so it cannot cause external effects outside its granted authority.
 
 ---
 
 ## 2. Attacker Model
 
-### 2.1 Threat Actors
+### 2.1 Threat Sources
 
-**Primary: Malicious/Compromised Agent Code**
-- AI agent code that attempts to exceed its authorized capabilities
-- Agents that have been prompt-injected or otherwise compromised
-- Tools or WASM modules with malicious intent
+**Primary: The Untrusted Program**
+- Program code that attempts to exceed its authorized capabilities
+- A program compromised at runtime by crafted input
+- Tools or WASM modules loaded by the program with malicious intent
 
 **Secondary: Malicious External Input**
-- Untrusted data from external APIs
-- User input designed to trigger unintended behavior
-- Network responses containing malicious payloads
+- Untrusted data from external responses
+- Input designed to trigger unintended behavior
+- Responses containing malicious payloads
 
 ### 2.2 Attacker Capabilities
 
 We assume the attacker can:
-- Execute arbitrary code within the agent sandbox
-- Make arbitrary syscalls (which will be mediated by AK)
+- Execute arbitrary code as the program inside the VM
+- Make arbitrary syscalls (which are mediated by AK)
 - Craft malicious tool inputs/outputs
 - Attempt to confuse policy matching through encoding tricks
 - Attempt time-of-check to time-of-use (TOCTOU) attacks
@@ -53,10 +53,10 @@ We assume the attacker CANNOT:
 **Goal:** No effectful operation can bypass Authority Kernel mediation.
 
 **Mechanism:**
-- All syscalls route through `ak_authorize_and_execute()`
-- POSIX syscalls are translated to AK effects
-- No direct hardware access from userspace
-- WASM hostcalls are capability-gated
+- Every Authority syscall (1024+) routes through `ak_dispatch()`
+- The program is the single workload in the VM; there is no other process or device path
+- No direct hardware access
+- WASM host calls are capability-gated
 
 ### 3.2 Deny-by-Default (INV-DENY)
 
@@ -82,8 +82,8 @@ We assume the attacker CANNOT:
 **Goal:** Resource consumption is bounded and tracked.
 
 **Mechanism:**
-- Per-run budget limits (tokens, calls, time, bytes)
-- Pre-admission budget check
+- Per-run budget limits (tokens, calls, time, bytes, heap, spawns)
+- Pre-admission budget check with overflow-safe, atomic accounting
 - Exceeded budget = operation denied
 
 ### 3.5 Audit Integrity (INV-4)
@@ -152,10 +152,10 @@ We assume the attacker CANNOT:
 **Attack:** Use tools or WASM to perform operations that bypass AK.
 
 **Mitigation:**
-- Tools cannot access FS/NET directly
-- Tool FS/NET operations route through AK
-- WASM hostcalls are capability-gated
-- No ambient authority in tool runtime
+- Tools cannot touch external state directly; their effects route through AK
+- The WASM interpreter is integer-only and fail-closed (float declarations/ops rejected)
+- WASM host calls are capability-gated
+- No ambient authority in the tool sandbox
 
 ### 4.7 DNS Rebinding
 
@@ -179,17 +179,17 @@ We assume the attacker CANNOT:
 
 ### 5.2 Untrusted Components
 
-- Agent application code
+- The program's code
 - Tool implementations
 - WASM modules
-- External network responses
-- User input
+- External responses
+- Input data
 
 ### 5.3 Boundary Enforcement
 
 Every crossing from untrusted to trusted requires:
-1. Effect creation with canonical target
-2. Policy authorization via `ak_authorize_and_execute()`
+1. A request with a canonical target
+2. Authorization via `ak_dispatch()` (capability + policy + budget)
 3. Audit logging
 4. Bounded, validated parameters
 

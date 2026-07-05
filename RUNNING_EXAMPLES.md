@@ -1,4 +1,4 @@
-# Running Authority Nanos Examples - Complete Guide
+# Running Authority Examples - Complete Guide
 
 ## 🎯 Quick Start
 
@@ -11,7 +11,7 @@ make -j$(nproc)
 ./examples/run_example.sh 1  # Heap operations
 ./examples/run_example.sh 2  # Authorization
 ./examples/run_example.sh 3  # Tool execution
-./examples/run_example.sh 4  # LLM inference
+./examples/run_example.sh 4  # Outbound request
 ./examples/run_example.sh 5  # Audit logging
 ```
 
@@ -44,7 +44,7 @@ Located in `examples/` - Run on host, communicate with kernel via syscalls.
 | 1 | `01_heap_operations.py` | Typed memory, JSON Patch | `./examples/run_example.sh 1` |
 | 2 | `02_authorization.py` | Capability authorization | `./examples/run_example.sh 2` |
 | 3 | `03_tool_execution.py` | WASM tool sandboxing | `./examples/run_example.sh 3` |
-| 4 | `04_inference.py` | LLM inference with policy | `./examples/run_example.sh 4` |
+| 4 | `04_inference.py` | Outbound request with policy | `./examples/run_example.sh 4` |
 | 5 | `05_audit_logging.py` | Audit log access | `./examples/run_example.sh 5` |
 
 **Expected Output**: Graceful error messages (kernel not running is normal)
@@ -65,7 +65,7 @@ Located in `kernel-examples/` - Run inside the unikernel.
 
 ## 🔧 Setup Instructions
 
-### Step 1: Build Authority Nanos
+### Step 1: Build Authority
 
 ```bash
 # Build everything
@@ -164,7 +164,7 @@ ops run main.py -c config.json
 #!/bin/bash
 set -e
 
-echo "🚀 Authority Nanos Full End-to-End Test"
+echo "🚀 Authority Full End-to-End Test"
 echo ""
 
 # 1. Build
@@ -294,7 +294,7 @@ chmod +x run_all_tests.sh
 
 ## 📚 Resources
 
-- **Host SDK Documentation**: [Authority Nanos Python SDK](docs/guide/python-sdk.md)
+- **Host SDK Documentation**: [Authority Python SDK](docs/guide/python-sdk.md)
 - **Kernel Documentation**: [Authority Kernel Architecture](docs/architecture/authority-kernel.html)
 - **ops Tool Docs**: [ops.city](https://ops.city/)
 - **GitHub**: [authority-systems/nanos](https://github.com/authority-systems/nanos)
@@ -320,6 +320,6 @@ chmod +x run_all_tests.sh
 
 For issues, please check:
 1. [Troubleshooting section above](#-troubleshooting)
-2. [Authority Nanos GitHub Issues](https://github.com/authority-systems/nanos/issues)
+2. [Authority GitHub Issues](https://github.com/authority-systems/nanos/issues)
 3. [ops Tool Documentation](https://ops.city/)
 4. [Nanos Unikernel Project](https://github.com/nanovms/nanos)

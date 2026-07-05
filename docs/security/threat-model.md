@@ -1,70 +1,68 @@
 # Threat Model
 
-This document defines the threat model for the Authority Kernel deny-by-default security system.
+This document defines the threat model for the Authority kernel's deny-by-default security system. Authority runs a **single untrusted program** per VM; the threat model is about sandboxing that program so it cannot cause external effects outside its granted authority.
 
 ## Threat Model Overview
 
 ```mermaid
 graph TB
-    subgraph "Threat Actors"
-        AGENT[Malicious Agent Code]
-        INJECT[Prompt Injection]
-        TOOL[Malicious Tools]
-        INPUT[Untrusted Input]
+    subgraph "Threat Sources"
+        PROGRAM[Malicious/Compromised Program]
+        INPUT[Untrusted Input Data]
+        TOOL[Malicious Tool/WASM Module]
+        NETRESP[Untrusted External Response]
     end
 
     subgraph "Attack Surface"
-        SYSCALL[Syscalls]
-        NETWORK[Network]
-        FILESYSTEM[Filesystem]
-        TOOLS[Tool Runtime]
+        SYSCALL[Authority Syscalls]
+        EFFECTS[External Effects]
+        TOOLS[Tool Sandbox]
     end
 
     subgraph "Defenses"
-        GATE[Authority Gate]
+        DISPATCH[ak_dispatch]
         POLICY[Policy Engine]
         CAP[Capability System]
         AUDIT[Audit Log]
     end
 
-    AGENT --> SYSCALL
-    INJECT --> SYSCALL
+    PROGRAM --> SYSCALL
+    INPUT --> SYSCALL
     TOOL --> TOOLS
-    INPUT --> NETWORK
+    NETRESP --> EFFECTS
 
-    SYSCALL --> GATE
-    NETWORK --> GATE
-    FILESYSTEM --> GATE
-    TOOLS --> GATE
+    SYSCALL --> DISPATCH
+    EFFECTS --> DISPATCH
+    TOOLS --> DISPATCH
 
-    GATE --> POLICY
-    GATE --> CAP
-    GATE --> AUDIT
+    DISPATCH --> POLICY
+    DISPATCH --> CAP
+    DISPATCH --> AUDIT
 
-    style GATE fill:#e74c3c,color:#fff
-    style AGENT fill:#c0392b,color:#fff
-    style INJECT fill:#c0392b,color:#fff
+    style DISPATCH fill:#e74c3c,color:#fff
+    style PROGRAM fill:#c0392b,color:#fff
+    style INPUT fill:#c0392b,color:#fff
 ```
 
 ## Attacker Model
 
-### Threat Actors
+### Threat Sources
 
-**Primary: Malicious/Compromised Agent Code**
-- AI agent code that attempts to exceed its authorized capabilities
-- Agents that have been prompt-injected or otherwise compromised
-- Tools or WASM modules with malicious intent
+**Primary: The Untrusted Program**
+- Program code that attempts to exceed its authorized capabilities
+- A program that has been compromised at runtime by crafted input
+- Tools or WASM modules loaded by the program with malicious intent
 
-**Secondary: Malicious External Input**
-- Untrusted data from external APIs
-- User input designed to trigger unintended behavior
-- Network responses containing malicious payloads
+**Secondary: Untrusted External Input**
+- Data returned from external requests
+- Input designed to trigger unintended behavior
+- Responses containing malicious payloads
 
 ### Attacker Capabilities
 
 We assume the attacker can:
-- Execute arbitrary code within the agent sandbox
-- Make arbitrary syscalls (which will be mediated by AK)
+- Execute arbitrary code as the program inside the VM
+- Make arbitrary syscalls (which are mediated by the Authority kernel)
 - Craft malicious tool inputs/outputs
 - Attempt to confuse policy matching through encoding tricks
 - Attempt time-of-check to time-of-use (TOCTOU) attacks
@@ -76,23 +74,22 @@ We assume the attacker CANNOT:
 - Modify kernel memory directly
 - Bypass CPU protection mechanisms (rings, MMU)
 - Access hardware directly (all I/O is virtualized)
-- Modify the policy after it's loaded
+- Modify the policy after it is loaded
 
 ## Security Goals
 
 ### Non-Bypass (INV-1)
 
-**Goal:** No effectful operation can bypass Authority Kernel mediation.
+**Goal:** No effectful operation can bypass Authority kernel mediation.
 
 **Mechanism:**
-- All syscalls route through `ak_authorize_and_execute()`
-- POSIX syscalls are translated to AK effects
-- No direct hardware access from userspace
-- WASM hostcalls are capability-gated
+- The program is the single workload in the VM; there is no other process or device path
+- Every Authority syscall (1024+) routes through `ak_dispatch()`
+- Tool and WASM operations that touch external state are capability-gated
 
 **Verification:**
 - Static analysis: No effectful paths that skip mediation
-- Runtime: Mode=HARD denies raw effectful syscalls
+- Runtime: raw/unknown syscalls are rejected
 
 ### Deny-by-Default (INV-DENY)
 
@@ -103,50 +100,33 @@ We assume the attacker CANNOT:
 - Missing policy = fail closed
 - Empty policy sections = deny that category
 
-**Verification:**
-- Test: Empty policy denies all effects
-- Test: Missing policy prevents boot or denies all
-
 ### Capability Integrity (INV-2)
 
 **Goal:** Capabilities cannot be forged or escalated.
 
 **Mechanism:**
-- Capabilities are HMAC-protected
-- Kernel controls capability issuance
+- Capabilities are HMAC-SHA256 protected
+- The kernel controls capability issuance
 - Delegation can only attenuate, never escalate
 - Revocation is immediate and audited
-
-**Verification:**
-- Test: Modified capability rejected
-- Test: Delegation cannot exceed parent scope
 
 ### Budget Enforcement (INV-3)
 
 **Goal:** Resource consumption is bounded and tracked.
 
 **Mechanism:**
-- Per-run budget limits (tokens, calls, time, bytes)
-- Pre-admission budget check
+- Per-run budget limits (tokens, calls, time, bytes, heap, spawns)
+- Pre-admission budget check with overflow-safe, atomic accounting
 - Exceeded budget = operation denied
-
-**Verification:**
-- Test: Exceeded token budget denies inference
-- Test: Exceeded call budget denies tool calls
 
 ### Audit Integrity (INV-4)
 
-**Goal:** All effectful operations are logged and logs are tamper-evident.
+**Goal:** All committed operations are logged and logs are tamper-evident.
 
 **Mechanism:**
 - Hash-chained audit entries
-- Synchronous logging for control-plane
-- Bounded ring buffer for data-plane
-- Audit append before response
-
-**Verification:**
-- Test: Audit chain verification detects tampering
-- Test: Control-plane ops appear in audit before response
+- Audit append before response is returned
+- Bounded ring buffer for high-volume events
 
 ## Attack Vectors and Mitigations
 
@@ -158,7 +138,7 @@ graph TB
         TOCTOU[TOCTOU<br/>Race Conditions]
         CAPLEAK[Capability Leakage]
         RESOURCE[Resource Exhaustion]
-        TOOLBYPASS[Tool Policy Bypass]
+        TOOLBYPASS[Tool Sandbox Bypass]
         DNSREBIND[DNS Rebinding]
     end
 
@@ -168,7 +148,7 @@ graph TB
         ATOMIC[Atomic Operations]
         HMAC[HMAC Protection]
         BUDGET[Budget Limits]
-        TOOLGATE[Tool AK Gateway]
+        SANDBOX[Integer-only WASM Sandbox]
         SPLITCAP[Separate DNS/Connect]
     end
 
@@ -177,7 +157,7 @@ graph TB
     TOCTOU --> ATOMIC
     CAPLEAK --> HMAC
     RESOURCE --> BUDGET
-    TOOLBYPASS --> TOOLGATE
+    TOOLBYPASS --> SANDBOX
     DNSREBIND --> SPLITCAP
 
     style PATH fill:#c0392b,color:#fff
@@ -188,18 +168,16 @@ graph TB
 
 ### Path Traversal
 
-**Attack:** Use `..` or symbolic links to access files outside allowed paths.
+**Attack:** Use `..` or symbolic links to reach targets outside allowed patterns.
 
 **Mitigation:**
 - Canonicalization before policy matching
 - Normalize `.` and `..` segments
-- Lexical canonicalization (symlinks not resolved in P0)
-
-**Residual Risk:** Symlink-based attacks (mitigated by not resolving symlinks)
+- Lexical canonicalization (symlinks not resolved)
 
 ### Encoding Confusion
 
-**Attack:** Use different encodings to confuse policy matching (e.g., %2e%2e for ..)
+**Attack:** Use different encodings to confuse policy matching (e.g. `%2e%2e` for `..`).
 
 **Mitigation:**
 - Decode before canonicalization
@@ -208,12 +186,11 @@ graph TB
 
 ### TOCTOU (Time-of-Check to Time-of-Use)
 
-**Attack:** Change target between policy check and actual operation.
+**Attack:** Change the target between the policy check and the operation.
 
 **Mitigation:**
 - Canonicalize immediately on syscall entry
-- Use canonical target for both check and operation
-- No user-controlled strings in policy matching
+- Use the canonical target for both check and operation
 
 ### Capability Leakage
 
@@ -222,8 +199,8 @@ graph TB
 **Mitigation:**
 - Capabilities are HMAC-protected
 - Keys are kernel-internal only
-- Capabilities are bound to run_id
-- Rate limiting prevents brute force
+- Capabilities are bound to `run_id`
+- Rate limiting resists brute force
 
 ### Resource Exhaustion
 
@@ -233,33 +210,32 @@ graph TB
 - Budget limits on all resource types
 - Bounded buffers throughout
 - Rate limiting on deny logging
-- Ring buffer for data-plane audit
+- Ring buffer for high-volume audit events
 
-### Policy Bypass via Tools
+### Tool Sandbox Bypass
 
-**Attack:** Use tools or WASM to perform operations that bypass AK.
+**Attack:** Use a tool or WASM module to perform an operation that bypasses the kernel.
 
 **Mitigation:**
-- Tools cannot access FS/NET directly
-- Tool FS/NET operations route through AK
-- WASM hostcalls are capability-gated
-- No ambient authority in tool runtime
+- Tools cannot touch external state directly; their effects route through the kernel
+- The WASM interpreter is integer-only and fail-closed: modules that declare or use floating point are rejected
+- No ambient authority in the tool sandbox
 
 ### DNS Rebinding
 
-**Attack:** DNS response changes between resolve and connect.
+**Attack:** A resolution result changes between resolve and connect.
 
 **Mitigation:**
-- Separate `net.dns` and `net.connect` capabilities
-- DNS resolution is an effect requiring authorization
-- Policy can require IP-based connect authorization
+- Separate DNS-resolution and connect authorization
+- Resolution is itself an effect requiring authorization
+- Policy can require destination-based connect authorization
 
 ### Audit Log Overflow
 
-**Attack:** Generate many events to overflow audit log.
+**Attack:** Generate many events to overflow the audit log.
 
 **Mitigation:**
-- Bounded ring buffer for data-plane
+- Bounded ring buffer for high-volume events
 - Rate limiting on deny messages
 - Control-plane events counted toward budget
 
@@ -275,18 +251,18 @@ graph TB
     end
 
     subgraph "UNTRUSTED"
-        AGENT[Agent Application]
+        PROGRAM[The Program]
         TOOLS[Tool Implementations]
         WASM[WASM Modules]
-        NETWORK[Network Responses]
-        USER[User Input]
+        NETWORK[External Responses]
+        USER[Input Data]
     end
 
     subgraph "BOUNDARY"
-        GATE[Authority Gate<br/>ak_authorize_and_execute]
+        GATE[Syscall Dispatch<br/>ak_dispatch]
     end
 
-    AGENT --> GATE
+    PROGRAM --> GATE
     TOOLS --> GATE
     WASM --> GATE
     NETWORK --> GATE
@@ -304,24 +280,24 @@ graph TB
 
 ### Trusted Components
 
-- Kernel code (including AK)
+- Kernel code (including the Authority kernel subsystem)
 - Policy file (validated at load time)
 - Capability keys (kernel-internal)
 - Audit log storage
 
 ### Untrusted Components
 
-- Agent application code
+- The program's code
 - Tool implementations
 - WASM modules
-- External network responses
-- User input
+- External responses
+- Input data
 
 ### Boundary Enforcement
 
 Every crossing from untrusted to trusted requires:
-1. Effect creation with canonical target
-2. Policy authorization via `ak_authorize_and_execute()`
+1. A request with a canonical target
+2. Authorization via `ak_dispatch()` (capability + policy + budget)
 3. Audit logging
 4. Bounded, validated parameters
 
@@ -331,16 +307,16 @@ Every crossing from untrusted to trusted requires:
 
 - CPU protection mechanisms work correctly
 - MMU enforces memory protection
-- Hypervisor (if any) is trusted
+- Hypervisor is trusted
 
 ### Kernel
 
 - Kernel code is not compromised
-- Kernel memory is protected from userspace
+- Kernel memory is protected from the program
 
 ### Policy
 
-- Policy is created by trusted administrator
+- Policy is created by a trusted administrator
 - Policy is not modified after load
 - Policy signature (if present) is verified
 
@@ -348,7 +324,6 @@ Every crossing from untrusted to trusted requires:
 
 - SHA-256 is collision-resistant
 - HMAC-SHA256 is unforgeable
-- Ed25519 signatures are secure
 
 ## Out of Scope
 
@@ -369,7 +344,7 @@ The following are explicitly NOT protected against:
 ### Denial of Service
 
 - Legitimate resource exhaustion within budget
-- Network-level DoS (external to kernel)
+- Network-level DoS (external to the kernel)
 
 ### Policy Errors
 
@@ -387,10 +362,9 @@ The following are explicitly NOT protected against:
 | ID | Invariant | Description |
 |----|-----------|-------------|
 | INV-1 | No-Bypass | All effects through mediation |
-| INV-2 | Capability | Every effectful op needs valid cap |
+| INV-2 | Capability | Every effectful op needs a valid cap |
 | INV-3 | Budget | Resource limits enforced |
 | INV-4 | Log Commitment | All ops audited before response |
 | INV-DENY | Deny-by-Default | No implicit permissions |
-| INV-SINGLE | Single Gate | One authorization function |
 | INV-CANONICAL | Canonicalization | Targets normalized before match |
 | INV-BOUNDED | Bounded Buffers | All buffers have max sizes |

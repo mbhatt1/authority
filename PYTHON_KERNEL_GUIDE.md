@@ -1,4 +1,4 @@
-# Python in Authority Nanos: Complete Guide
+# Python in Authority: Complete Guide
 
 **Status**: Ready for Testing
 **Python Version**: 3.10.12
@@ -138,7 +138,7 @@ tools/minops/minops run examples/test-python.py
 Expected Output:
 ```
 ============================================================
-Authority Nanos - Python Execution Test
+Authority - Python Execution Test
 ============================================================
 
 ✅ Test 1: Basic print statement
@@ -156,7 +156,7 @@ Authority Nanos - Python Execution Test
    Sum of 1-10: 55
 
 ✅ Test 5: String operations
-   Original: Authority Nanos
+   Original: Authority
    Reversed: sonaN ytirehtuA
    Uppercase: AUTHORITY NANOS
 
@@ -495,8 +495,8 @@ objdump -x output/platform/pc/bin/kernel.img
 
 After confirming Python execution works:
 
-1. **Integrate with Agent Workflow**
-   - Use Python scripts as agent actions
+1. **Integrate into a Workflow**
+   - Use Python scripts as workload actions
    - Map to capabilities in policy
    - Monitor audit logs for behavior
 
@@ -557,14 +557,14 @@ tools/minops/minops run ~/nanos-test/main.py -m 512
 
 ## Summary
 
-✅ **Python 3.10 is now executable in Authority Nanos**
+✅ **Python 3.10 is now executable in Authority**
 
 - Complete rootfs with standard library: `/tmp/nanos-root/`
 - 1006 shared libraries included
 - Test suite in `examples/test-python.py`
 - Full sandbox security via 4 cryptographic invariants
 - Tamper-evident audit logging for every operation
-- Ready for agent workflows and production deployments
+- Ready for production workloads
 
 **Start Testing**: `tools/minops/minops run examples/test-python.py -m 512 -v`
 

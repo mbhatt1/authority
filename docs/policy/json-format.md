@@ -1,42 +1,12 @@
 # JSON Policy Format
 
-The primary policy format for Authority Kernel P0.
+JSON is the policy format parsed by the compiled policy engine (`src/agentic/ak_policy.c`). This page documents the schema that engine actually parses.
 
 ## Complete Example
 
 ```json
 {
   "version": "1.0",
-
-  "fs": {
-    "read": [
-      "/app/**",
-      "/lib/**",
-      "/usr/lib/**"
-    ],
-    "write": [
-      "/tmp/**",
-      "/app/data/**"
-    ]
-  },
-
-  "net": {
-    "dns": [
-      "api.github.com",
-      "*.googleapis.com"
-    ],
-    "connect": [
-      "dns:api.github.com:443",
-      "dns:*.googleapis.com:443",
-      "ip:10.0.0.0/8:5432"
-    ],
-    "bind": [
-      "ip:0.0.0.0:8080"
-    ],
-    "listen": [
-      "ip:0.0.0.0:8080"
-    ]
-  },
 
   "tools": {
     "allow": [
@@ -50,37 +20,32 @@ The primary policy format for Authority Kernel P0.
     ]
   },
 
-  "wasm": {
-    "modules": [
-      "trusted_module",
-      "crypto_utils"
+  "domains": {
+    "allow": [
+      "api.github.com",
+      "*.googleapis.com"
     ],
-    "hostcalls": [
-      "fs_read",
-      "net_fetch",
-      "crypto_sign"
+    "deny": [
+      "*.internal"
     ]
   },
 
-  "infer": {
-    "models": [
-      "gpt-4",
-      "claude-*"
-    ],
-    "max_tokens": 100000
+  "taint": {
+    "sources": ["external_response"],
+    "sinks": ["outbound_request"],
+    "sanitizers": ["validate_json"]
   },
 
   "budgets": {
-    "tool_calls": 100,
     "tokens": 100000,
-    "wall_time_ms": 300000,
-    "cpu_ns": 60000000000,
-    "bytes": 104857600
-  },
-
-  "profiles": [
-    "tier1-musl"
-  ]
+    "calls": 100,
+    "inference_ms": 60000,
+    "file_bytes": 10485760,
+    "network_bytes": 104857600,
+    "spawn_count": 8,
+    "heap_objects": 10000,
+    "heap_bytes": 104857600
+  }
 }
 ```
 
@@ -88,116 +53,11 @@ The primary policy format for Authority Kernel P0.
 
 ### version (required)
 
-Must be `"1.0"` for P0.
-
 ```json
-{
-  "version": "1.0"
-}
+{ "version": "1.0" }
 ```
 
-### fs (Filesystem Rules)
-
-Controls file access.
-
-```json
-{
-  "fs": {
-    "read": ["pattern1", "pattern2"],
-    "write": ["pattern3"]
-  }
-}
-```
-
-**Pattern Syntax:**
-
-| Pattern | Description |
-|---------|-------------|
-| `/path/to/file` | Exact file |
-| `/path/to/dir/*` | Files in directory |
-| `/path/to/dir/**` | Recursive (all files under directory) |
-| `*.txt` | Files ending in .txt |
-
-**Example:**
-
-```json
-{
-  "fs": {
-    "read": [
-      "/app/**",
-      "/etc/hosts",
-      "/lib/**",
-      "/proc/self/**"
-    ],
-    "write": [
-      "/tmp/**",
-      "/app/logs/**"
-    ]
-  }
-}
-```
-
-### net (Network Rules)
-
-Controls network access.
-
-```json
-{
-  "net": {
-    "dns": ["domain patterns"],
-    "connect": ["connection patterns"],
-    "bind": ["bind patterns"],
-    "listen": ["listen patterns"]
-  }
-}
-```
-
-**DNS Patterns:**
-
-| Pattern | Matches |
-|---------|---------|
-| `example.com` | Exact domain |
-| `*.example.com` | Subdomains |
-| `*` | Any domain (dangerous!) |
-
-**Connect Patterns:**
-
-| Pattern | Matches |
-|---------|---------|
-| `dns:example.com:443` | Connect to resolved IP of domain |
-| `dns:*.example.com:*` | Any subdomain, any port |
-| `ip:10.0.0.0/8:5432` | IP CIDR with port |
-| `ip:1.2.3.4:443` | Specific IP and port |
-
-**Bind/Listen Patterns:**
-
-| Pattern | Matches |
-|---------|---------|
-| `ip:0.0.0.0:8080` | Bind to all interfaces, port 8080 |
-| `ip:[::]:8080` | IPv6 all interfaces |
-| `ip:127.0.0.1:*` | Localhost, any port |
-
-**Example:**
-
-```json
-{
-  "net": {
-    "dns": [
-      "api.github.com",
-      "*.googleapis.com"
-    ],
-    "connect": [
-      "dns:api.github.com:443",
-      "dns:*.googleapis.com:443",
-      "ip:10.0.0.0/8:5432"
-    ],
-    "bind": ["ip:0.0.0.0:8080"],
-    "listen": ["ip:0.0.0.0:8080"]
-  }
-}
-```
-
-### tools (Tool Rules)
+### tools
 
 Controls tool execution via `AK_SYS_CALL`.
 
@@ -218,178 +78,117 @@ Controls tool execution via `AK_SYS_CALL`.
 | `prefix_*` | Prefix match |
 | `*` | Any tool (dangerous!) |
 
-**Precedence:** deny rules take precedence over allow.
+**Precedence:** deny rules take precedence over allow. An unmatched tool is denied.
 
-**Example:**
+### domains
 
-```json
-{
-  "tools": {
-    "allow": ["http_get", "http_post", "file_*", "json_parse"],
-    "deny": ["file_delete", "shell_exec"]
-  }
-}
-```
-
-### wasm (WASM Rules)
-
-Controls WASM module execution and host calls.
+Controls outbound destinations.
 
 ```json
 {
-  "wasm": {
-    "modules": ["module_names"],
-    "hostcalls": ["allowed_hostcalls"]
+  "domains": {
+    "allow": ["api.github.com", "*.googleapis.com"],
+    "deny": ["*.internal"]
   }
 }
 ```
-
-**Example:**
-
-```json
-{
-  "wasm": {
-    "modules": ["crypto_utils", "data_processor", "trusted_*"],
-    "hostcalls": ["fs_read", "net_fetch", "crypto_sign", "crypto_verify"]
-  }
-}
-```
-
-### infer (Inference Rules)
-
-Controls LLM inference requests.
-
-```json
-{
-  "infer": {
-    "models": ["model_patterns"],
-    "max_tokens": 100000
-  }
-}
-```
-
-**Model Patterns:**
 
 | Pattern | Matches |
 |---------|---------|
-| `gpt-4` | Exact model |
-| `claude-*` | Any Claude model |
-| `*` | Any model |
+| `example.com` | Exact domain |
+| `*.example.com` | Subdomains |
+| `*` | Any domain (dangerous!) |
 
-**Example:**
+An unmatched domain is denied.
+
+### taint
+
+Declares taint sources, sinks, and sanitizers for taint-flow tracking.
 
 ```json
 {
-  "infer": {
-    "models": ["gpt-4", "gpt-3.5-turbo", "claude-3-opus", "claude-*"],
-    "max_tokens": 100000
+  "taint": {
+    "sources": ["external_response"],
+    "sinks": ["outbound_request", "file_write"],
+    "sanitizers": ["validate_json"]
   }
 }
 ```
 
 ### budgets
 
-Resource limits for the run.
+Resource limits for the run. Unknown numeric keys are ignored; `calls` and `tool_calls` are aliases.
 
 ```json
 {
   "budgets": {
-    "tool_calls": 100,
     "tokens": 100000,
-    "wall_time_ms": 300000,
-    "cpu_ns": 60000000000,
-    "bytes": 104857600
+    "calls": 100,
+    "inference_ms": 60000,
+    "file_bytes": 10485760,
+    "network_bytes": 104857600,
+    "spawn_count": 8,
+    "heap_objects": 10000,
+    "heap_bytes": 104857600
   }
 }
 ```
 
-| Budget | Description | Example |
-|--------|-------------|---------|
-| `tool_calls` | Max tool invocations | 100 |
-| `tokens` | Max LLM tokens (in+out) | 100000 |
-| `wall_time_ms` | Max wall clock time (ms) | 300000 (5 min) |
-| `cpu_ns` | Max CPU time (ns) | 60000000000 (60s) |
-| `bytes` | Max I/O bytes | 104857600 (100MB) |
+| Budget | Description |
+|--------|-------------|
+| `tokens` | Outbound-request units |
+| `calls` / `tool_calls` | Max tool invocations |
+| `inference_ms` | Max outbound-request time (ms) |
+| `file_bytes` | Max file I/O bytes |
+| `network_bytes` | Max network I/O bytes |
+| `spawn_count` | Max spawned children |
+| `heap_objects` | Max heap objects |
+| `heap_bytes` | Max heap bytes |
 
-### profiles
+### signature (optional)
 
-Include predefined policy fragments.
+A hex-encoded HMAC-SHA256 tag (64 hex chars for the 32-byte MAC, or 128 hex chars for the full field). When present and verified against the signing key, `signature_verified` is set; unsigned policies are never treated as verified.
 
 ```json
-{
-  "profiles": ["tier1-musl", "custom_profile"]
-}
+{ "signature": "<64 or 128 hex chars>" }
 ```
-
-**Built-in Profiles:**
-
-| Profile | Description |
-|---------|-------------|
-| `tier1-musl` | Minimal for static/musl binaries |
-| `tier2-glibc` | Additional rules for dynamic/glibc |
 
 ## Common Patterns
 
-### Web Application
+### Restricted Program
 
 ```json
 {
   "version": "1.0",
-  "fs": {
-    "read": ["/app/**", "/etc/ssl/**"],
-    "write": ["/app/logs/**", "/tmp/**"]
-  },
-  "net": {
-    "dns": ["*"],
-    "connect": ["dns:*:443", "dns:*:80"],
-    "bind": ["ip:0.0.0.0:8080"],
-    "listen": ["ip:0.0.0.0:8080"]
-  },
-  "profiles": ["tier1-musl"]
-}
-```
-
-### Database Client
-
-```json
-{
-  "version": "1.0",
-  "fs": {
-    "read": ["/app/**", "/etc/ssl/**"]
-  },
-  "net": {
-    "dns": ["db.internal"],
-    "connect": ["dns:db.internal:5432"]
-  },
-  "profiles": ["tier1-musl"]
-}
-```
-
-### AI Agent
-
-```json
-{
-  "version": "1.0",
-  "fs": {
-    "read": ["/app/**"],
-    "write": ["/app/workspace/**"]
-  },
-  "net": {
-    "dns": ["api.openai.com", "api.anthropic.com"],
-    "connect": ["dns:api.openai.com:443", "dns:api.anthropic.com:443"]
-  },
   "tools": {
-    "allow": ["http_get", "file_read", "file_write"],
+    "allow": ["http_get", "file_read"],
     "deny": ["shell_exec"]
   },
-  "infer": {
-    "models": ["gpt-4", "claude-*"],
-    "max_tokens": 100000
+  "domains": {
+    "allow": ["api.example.com"]
   },
   "budgets": {
-    "tool_calls": 50,
+    "calls": 50,
     "tokens": 100000
-  },
-  "profiles": ["tier1-musl"]
+  }
 }
 ```
+
+### Outbound-Only Program
+
+```json
+{
+  "version": "1.0",
+  "domains": {
+    "allow": ["api.example.com", "*.cdn.example.com"]
+  },
+  "budgets": {
+    "tokens": 100000,
+    "inference_ms": 60000
+  }
+}
+```
+
+## Not Parsed by the Compiled Engine
+
+Older drafts referenced `fs`, `net`, `wasm`, `infer`, and `profiles` sections. `ak_policy.c` does **not** parse these; they belong to the effect layer that is not in the current kernel build. Use `tools`, `domains`, `taint`, and `budgets`.

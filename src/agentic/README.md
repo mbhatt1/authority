@@ -1,261 +1,145 @@
 # Authority Kernel
 
-**The Security Layer Powering Authority Nanos**
+The capability-based security subsystem of Authority (a Nanos fork).
 
 ## Overview
 
-The Authority Kernel (AK) is the security subsystem that makes **Authority Nanos** the premier unikernel for AI agents. It implements a capability-based security model with comprehensive audit logging, ensuring that autonomous agents operate within strictly defined boundaries while maintaining complete auditability.
+The Authority Kernel (AK) enforces kernel-level security on the single untrusted
+program running in the VM. It implements a capability-based access-control model
+with a tamper-evident audit log, so the program operates within strictly defined
+boundaries and every operation is provable after the fact.
 
-Authority Nanos = Nanos unikernel + Authority Kernel subsystem
+Authority = Nanos unikernel + Authority Kernel subsystem.
 
 ## Security Invariants
 
-The Authority Kernel enforces four fundamental security invariants:
+The Authority Kernel enforces four invariants inside the syscall dispatch path
+(`ak_syscall_handler` → `ak_dispatch`), before any effect executes:
 
-### INV-1: No-Bypass Invariant
-> Every external effect occurs through a kernel-mediated syscall.
+### INV-1: No-Bypass
+> The program reaches external effects only through the Authority syscalls (1024+).
 
-The unikernel boundary ensures no direct hardware or network access bypasses the kernel.
+VM isolation plus syscall gating ensure no direct hardware or network access
+bypasses the kernel.
 
-### INV-2: Capability Invariant
-> Every effectful syscall must carry a valid, non-revoked capability whose scope subsumes the request.
+### INV-2: Capability
+> Every effectful syscall must be authorized by a valid, non-revoked capability whose scope subsumes the request.
+
+Authorization is a per-call token (passed in the syscall's `arg5`), a delegated
+grant held in the context, or the root context's admin capability.
 
 ```c
-s64 ak_capability_validate(
-    ak_capability_t *cap,
-    ak_cap_type_t required_type,
-    const char *resource,
-    const char *method,
-    u8 *run_id
-);
+s64 ak_capability_validate(ak_capability_t *cap, ak_cap_type_t required_type,
+                           const char *resource, const char *method, u8 *run_id);
 ```
 
-### INV-3: Budget Invariant
-> The sum of in-flight and committed costs never exceeds budget.
+### INV-3: Budget
+> Admission control rejects operations that would exceed a declared budget.
 
-Admission control prevents resource exhaustion:
+Budgets are hard, atomic, and overflow-safe.
+
 ```c
 s64 ak_budget_reserve(ak_budget_tracker_t *tracker,
                       ak_resource_type_t type, u64 amount);
 ```
 
-### INV-4: Log Commitment Invariant
-> Each committed transition appends a log entry whose hash chain validates from genesis to head.
+### INV-4: Log Commitment
+> Each committed operation appends a hash-chained audit entry, made durable before the response is returned.
 
-Tamper-evident audit log with hash chain:
 ```c
 s64 ak_audit_append(u8 *pid, u8 *run_id, u16 op,
                     u8 *req_hash, u8 *res_hash, u8 *policy_hash);
 ```
 
-## Architecture
+## Enforcement Pipeline
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Agent Process                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                   Agent Code                         │   │
-│  │  • LLM Inference       • Tool Execution             │   │
-│  │  • State Management    • Communication              │   │
-│  └────────────────────────┬────────────────────────────┘   │
-│                           │ AK Syscalls (1024-1100)        │
-├───────────────────────────┼─────────────────────────────────┤
-│                           ▼                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Authority Kernel                        │   │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐            │   │
-│  │  │Capability│ │  Audit   │ │  Policy  │            │   │
-│  │  │  System  │ │   Log    │ │  Engine  │            │   │
-│  │  └──────────┘ └──────────┘ └──────────┘            │   │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐            │   │
-│  │  │  Typed   │ │   IPC    │ │ Syscall  │            │   │
-│  │  │   Heap   │ │Transport │ │ Dispatch │            │   │
-│  │  └──────────┘ └──────────┘ └──────────┘            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                    Nanos Kernel                             │
-└─────────────────────────────────────────────────────────────┘
-```
+`ak_dispatch()` runs every request through six stages before the effect
+executes: (1) request validation, (2) anti-replay, (3) capability check (INV-2),
+(4) policy + budget admission (INV-3), (5) execute the handler, (6) append to the
+hash-chained audit log and make it durable (INV-4).
 
 ## Syscall Interface
 
 | Number | Name | Description |
 |--------|------|-------------|
-| 1024 | READ | Read object from typed heap |
-| 1025 | ALLOC | Allocate new heap object |
-| 1026 | WRITE | Update object with JSON Patch |
-| 1027 | DELETE | Soft-delete object |
-| 1028 | QUERY | Query objects by predicate |
-| 1029 | BATCH | Atomic batch operations |
-| 1030 | COMMIT | Checkpoint audit log |
-| 1031 | CALL | Invoke tool in WASM sandbox |
-| 1032 | SPAWN | Create child agent |
-| 1033 | SEND | Send message to agent |
+| 1024 | READ | Read object from the typed heap |
+| 1025 | ALLOC | Allocate a heap object |
+| 1026 | WRITE | Update an object (RFC 6902 JSON Patch, CAS) |
+| 1027 | DELETE | Soft-delete an object |
+| 1028 | QUERY | Query the audit log |
+| 1029 | BATCH | Atomic batch of operations |
+| 1030 | COMMIT | Checkpoint the audit log |
+| 1031 | CALL | Execute a tool in the WASM sandbox |
+| 1032 | SPAWN | Create a child context |
+| 1033 | SEND | Send a message |
 | 1034 | RECV | Receive messages |
-| 1035 | RESPOND | Send response to orchestrator |
-| 1036 | ASSERT | Record assertion |
-| 1037 | INFERENCE | Invoke LLM |
+| 1035 | RESPOND | Return a response (DLP applied) |
+| 1036 | ASSERT | Record an assertion |
+| 1037 | INFERENCE | Invoke an outbound request handler |
+| 1038-1040 | BUDGET_STATUS / HISTORY / BREAKDOWN | Budget introspection |
+| 1041 | INFER_ISSUE | Issue an outbound HTTP(S) request (non-blocking) |
+| 1042 | INFER_POLL | Poll for an issued request's result |
+
+External effects (outbound HTTP, tool calls) use an async issue/poll model: the
+kernel enforces the request synchronously on issue, performs the I/O on the
+runloop, and the program polls for the result.
 
 ## Components
 
-### Capability System (`ak_capability.h/c`)
-- HMAC-SHA256 signed tokens
-- Scope-based access control
-- Key rotation with grace period
-- Constant-time verification
-- Immediate revocation
-
-### Typed Heap (`ak_heap.h/c`)
-- Versioned objects with CAS semantics
-- JSON Schema validation
-- RFC 6902 JSON Patch support
-- Transaction support for BATCH
-- Taint tracking
-
-### Audit Log (`ak_audit.h/c`)
-- Hash-chained entries
-- Crash recovery
-- External anchoring
-- Replay bundle support
-
-### Policy Engine (`ak_policy.h/c`)
-- YAML policy format
-- Budget enforcement
-- Tool allowlists
-- Domain restrictions
-- Taint flow rules
-
-### IPC Transport (`ak_ipc.h/c`)
-- Framed protocol with CRC-32C
-- Sequence-based replay protection
-- JSON serialization
-
-### Syscall Dispatcher (`ak_syscall.h/c`)
-- Central enforcement point
-- 10-stage validation pipeline
-- Per-operation handlers
+- **Capability system** (`ak_capability.c/.h`) — HMAC-SHA256 tokens, scope
+  matching, monotonic key rotation, constant-time verification, revocation.
+- **Typed heap** (`ak_heap.c/.h`) — versioned objects with CAS, RFC 6902 JSON
+  Patch, transactions for BATCH, taint tracking.
+- **Audit log** (`ak_audit.c/.h`) — hash-chained entries, file-header
+  persistence, durable-before-response, crash recovery.
+- **Policy engine** (`ak_policy.c/.h`) — JSON policy: deny-by-default budgets,
+  tool allow/deny, domain rules, taint flow.
+- **Budget control** (`ak_budget.c/.h`) — hard, atomic, overflow-safe limits.
+- **WASM sandbox** (`ak_wasm.c`, `ak_wasm_interp.c`) — an integer-only bytecode
+  interpreter; the kernel is built `-mno-sse`, so float ops are rejected
+  fail-closed.
+- **Outbound transport** (`ak_transport.c`; klib `ak_https.c`) — async HTTP(S)
+  over the network stack.
+- **Syscall dispatch** (`ak_syscall.c`) — the enforcement pipeline.
 
 ## Building
 
-Add to Nanos kernel.mk:
-
-```makefile
-KERNEL_SRCS += $(wildcard $(SRCDIR)/agentic/*.c)
-KERNEL_CFLAGS += -I$(SRCDIR)/agentic -DCONFIG_AK_ENABLED=1
-```
-
-Or use the module Makefile:
+The Authority sources are compiled into `kernel.elf` by the platform Makefiles
+(see `platform/pc/Makefile`, `platform/virt/Makefile`,
+`platform/riscv-virt/Makefile`, guarded by `-DCONFIG_AK_ENABLED`). Build the
+kernel from the repository root:
 
 ```bash
-cd src/agentic
-make
+make PLATFORM=pc CROSS_COMPILE=x86_64-elf- kernel
 ```
 
-## Configuration
+`libak` (the userspace helper library and Python SDK glue) is built with the
+module Makefile:
 
-### Policy Format (YAML)
-
-```yaml
-version: "1.0"
-
-budgets:
-  tokens: 100000
-  calls: 50
-  inference_ms: 60000
-  file_bytes: 10485760
-
-tools:
-  allow:
-    - "file_read"
-    - "http_get"
-  deny:
-    - "shell_exec"
-
-domains:
-  allow:
-    - "*.github.com"
-  deny:
-    - "*.internal"
-
-taint:
-  sources:
-    - "user_input"
-  sinks:
-    - "shell_exec"
-  sanitizers:
-    - "html_escape"
+```bash
+cd src/agentic && make libak
 ```
 
-## Security Considerations
+## Policy Format (JSON)
 
-### Fail-Closed Design
-All validation functions return denial by default:
-- Unknown capability → denied
-- Missing policy → denied
-- Taint violation → denied
-
-### Timing Attack Resistance
-Capability verification uses constant-time comparison:
-```c
-static boolean constant_time_compare(u8 *a, u8 *b, u64 len)
+```json
 {
-    u8 result = 0;
-    for (u64 i = 0; i < len; i++)
-        result |= a[i] ^ b[i];
-    return result == 0;
+  "version": "1.0",
+  "budgets": { "tokens": 100000, "calls": 50, "inference_ms": 60000, "file_bytes": 10485760 },
+  "tools":   { "allow": ["file_read", "http_get"], "deny": ["shell_exec"] },
+  "domains": { "allow": ["*.example.com"], "deny": ["*.internal"] },
+  "taint":   { "sources": ["user_input"], "sinks": ["shell_exec"], "sanitizers": ["html_escape"] }
 }
 ```
 
-### Capability Revocation
-Revocation is immediate and persistent:
-- Stored in revocation map
-- Survives kernel restart
-- Logged to audit trail
+## Security Notes
 
-### Audit Log Integrity
-Hash chain prevents undetected tampering:
-```
-hash[n] = SHA256(hash[n-1] || entry[n])
-```
-
-## Testing
-
-### Unit Tests
-```c
-void test_capability_verify(void);
-void test_heap_cas_semantics(void);
-void test_audit_chain_integrity(void);
-void test_policy_evaluation(void);
-```
-
-### Integration Tests
-```c
-void test_full_syscall_pipeline(void);
-void test_batch_atomicity(void);
-void test_revocation_propagation(void);
-```
-
-### Security Tests
-```c
-void test_replay_detection(void);
-void test_capability_forgery(void);
-void test_taint_flow_blocking(void);
-void test_budget_exhaustion(void);
-```
+- **Fail-closed**: unknown capability, missing policy, or taint violation → denied.
+- **Timing resistance**: capability MAC comparison is constant-time.
+- **Revocation**: keyed on the full 16-byte token id, checked on every use.
+- **Audit integrity**: `hash[n] = SHA256(hash[n-1] || entry[n])`; any change to a
+  past entry invalidates every subsequent hash.
 
 ## License
 
 Apache-2.0
-
-## References
-
-- [Authority Nanos Main Documentation](../../README.md)
-- [Authority Kernel Specification](../../IMPLEMENTATION_SPEC.md)
-- [Security Invariants](../../SECURITY_INVARIANTS.md)
-- [Authority Nanos FAQ](../../FAQ.md)
-- [Nanos Unikernel](https://github.com/mbhatt1/nanos)
-- [RFC 6902: JSON Patch](https://tools.ietf.org/html/rfc6902)
-- [JSON Schema](https://json-schema.org/)
-
----
-
-**Part of [Authority Nanos](../../README.md) — The AI-First Unikernel**

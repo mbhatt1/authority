@@ -1,6 +1,6 @@
 # Build Scripts and Utilities
 
-This page documents build scripts and automation utilities for Authority Nanos development.
+This page documents build scripts and automation utilities for Authority development.
 
 ## Overview
 

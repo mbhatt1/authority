@@ -1,59 +1,57 @@
 # AK Base Contract v1
 
 **Version:** 1.0
-**Date:** 2026-01-16
 **Status:** ACTIVE
 
-This document defines the fundamental security contract between the Authority Kernel and applications.
+This document defines the fundamental security contract between the Authority kernel and the untrusted program it runs.
 
 ---
 
 ## 1. Core Principle: Deny-by-Default
 
-The Authority Kernel operates on a **deny-by-default** principle:
+The Authority kernel operates on a **deny-by-default** principle:
 
-> If policy cannot prove an operation is allowed, it is denied.
+> If authorization cannot be resolved for an operation, it is denied.
 
-There are NO implicit permissions. Every effectful operation requires explicit policy authorization.
+There are NO implicit permissions. Every effectful operation requires an explicit, resolvable capability.
 
 ---
 
-## 2. Boot Capsule Mechanism
+## 2. Boot Policy Load
 
 ### 2.1 Problem Statement
 
 Deny-by-default creates a chicken-and-egg problem:
-- Policy must be loaded before user processes start
+- Policy must be loaded before the program starts
 - But loading policy requires file access
 - File access requires policy permission
 
-### 2.2 Solution: Pre-User Policy Load (Option A)
+### 2.2 Solution: Pre-Program Policy Load
 
-The Authority Kernel uses **Option A: Pre-User Policy Load**:
+The Authority kernel loads policy **before** the untrusted program starts:
 
 1. Kernel boots with minimal internal capabilities
-2. **Before** any user process starts:
+2. **Before** the program starts:
    - Kernel reads policy from initrd `/ak/policy.json`
    - Only kernel-internal reads are allowed
-   - No user code executes during this phase
+   - No untrusted code executes during this phase
 3. Policy is validated and installed
-4. User process starts with policy already active
-5. No "boot capsule" capability needs to be dropped
+4. The program starts with policy already active
 
 ### 2.3 Policy Load Order
 
-1. **Embedded Policy** (compile-time): If `CONFIG_AK_EMBEDDED_POLICY` is set, use embedded policy blob
+1. **Embedded Policy** (compile-time): If `CONFIG_AK_EMBEDDED_POLICY` is set, use the embedded policy blob
 2. **Initrd Policy**: Read `/ak/policy.json` from initrd
-3. **Fail Closed**: If no policy found:
+3. **Fail Closed**: If no policy is found:
    - Deny all operations
-   - Print clear console message with expected location
-   - Do NOT start user process
+   - Print a clear console message with the expected location
+   - Do NOT start the program
 
 ---
 
 ## 3. Effect Categories
 
-All effectful operations are categorized:
+Effectful operations are categorized. The following taxonomy describes the effect surface and the capability each requires.
 
 ### 3.1 Filesystem Effects
 
@@ -73,19 +71,19 @@ All effectful operations are categorized:
 | `AK_E_NET_BIND` | Bind to port | `net.bind` |
 | `AK_E_NET_LISTEN` | Listen for connections | `net.listen` |
 
-### 3.3 Agentic Effects
+### 3.3 Program Effects
 
 | Effect | Description | Required Cap |
 |--------|-------------|--------------|
 | `AK_E_TOOL_CALL` | Execute tool | `tools.call` |
 | `AK_E_WASM_INVOKE` | Run WASM module | `wasm.invoke` |
-| `AK_E_INFER` | LLM inference | `infer.model` |
+| `AK_E_OUTBOUND` | Outbound external request | `infer.model` |
 
 ---
 
 ## 4. Deny Response Contract
 
-When an operation is denied, the Authority Kernel provides:
+When an operation is denied, the Authority kernel provides:
 
 ### 4.1 Immediate Response
 
@@ -110,16 +108,10 @@ struct ak_last_deny {
 
 ### 4.3 Suggested Snippet Format
 
-For file access denial:
-```toml
-# Add to ak.toml [fs] section:
-read = ["/path/to/denied/file"]
-```
+Denials include a copy-pasteable JSON policy fragment (JSON is the compiled policy format). For a denied tool:
 
-For network denial:
-```toml
-# Add to ak.toml [net] section:
-connect = ["dns:example.com:443"]
+```json
+{ "tools": { "allow": ["the_denied_tool"] } }
 ```
 
 ---
@@ -128,18 +120,15 @@ connect = ["dns:example.com:443"]
 
 ### 5.1 Control-Plane Events
 
-Synchronous logging for:
+Durable logging for:
 - Policy changes
 - Tool calls
 - WASM invocations
-- Inference requests
+- Outbound requests
 
 ### 5.2 Data-Plane Events
 
-Bounded ring buffer for:
-- File opens
-- Network connections
-- Rate-limited (no per-event fsync)
+Bounded ring buffer for high-volume events, rate-limited (no per-event durability barrier).
 
 ### 5.3 Audit Entry Format
 
@@ -158,49 +147,40 @@ struct ak_audit_entry {
 
 ## 6. Integration Test Requirements
 
-The following tests MUST pass for the base contract:
-
 ### 6.1 Deny-by-Default Test
 
 ```
-GIVEN: Minimal policy (empty fs/net sections)
-WHEN: Application attempts file open
+GIVEN: Minimal policy (empty tool/domain sections)
+WHEN:  The program attempts a gated operation
 THEN:
   - Operation denied with EACCES
-  - last_deny populated with:
-    - op = AK_E_FS_OPEN
-    - target = canonical path
-    - missing_cap = "fs.read"
-    - suggested_snippet = valid TOML
+  - last_deny populated with op, canonical target,
+    missing_cap, and a valid suggested_snippet
 ```
 
 ### 6.2 Allow Test
 
 ```
-GIVEN: Policy with fs.read = ["/allowed/**"]
-WHEN: Application opens /allowed/file.txt
-THEN:
-  - Operation succeeds
-  - File descriptor returned
+GIVEN: Policy allowing the operation
+WHEN:  The program performs it
+THEN:  Operation succeeds
 ```
 
-### 6.3 Network DNS Test
+### 6.3 Domain Test
 
 ```
-GIVEN: Policy with net.dns = ["example.com"]
-WHEN: Application resolves example.com
-THEN: Resolution succeeds
+GIVEN: Policy with an allowed domain pattern
+WHEN:  The program targets a matching domain
+THEN:  Resolution/connect authorized
 
-WHEN: Application resolves other.com
-THEN:
-  - Resolution denied
-  - last_deny shows net.dns missing
+WHEN:  The program targets a non-matching domain
+THEN:  Denied; last_deny shows the missing domain authorization
 ```
 
 ---
 
 ## 7. Version History
 
-| Version | Date | Changes |
-|---------|------|---------|
-| 1.0 | 2026-01-16 | Initial version |
+| Version | Changes |
+|---------|---------|
+| 1.0 | Initial version |

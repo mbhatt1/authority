@@ -1,6 +1,6 @@
 # Runtime Testing
 
-This page documents runtime testing for Authority Nanos in the unikernel.
+This page documents runtime testing for Authority in the unikernel.
 
 ## Overview
 
@@ -158,6 +158,12 @@ int main(void) {
 ```
 
 ### Integration Test Template
+
+> Note: the effect API below (`ak_effect_req_t` / `ak_authorize_and_execute`,
+> and `ak_policy_v2`) is the legacy request frontend and is **not compiled into
+> the kernel**. The enforced path is `ak_syscall_handler` → `ak_dispatch`, which
+> runs the six-stage pipeline (validate, anti-replay, capability, policy+budget,
+> execute, audit). The example is retained to illustrate policy-decision testing.
 
 ```c
 #include "ak_integration.h"

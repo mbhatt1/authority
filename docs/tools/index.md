@@ -1,10 +1,10 @@
 # Tools & Utilities
 
-This section documents tools and utilities for developing and debugging Authority Nanos.
+This section documents tools and utilities for developing and debugging Authority.
 
 ## Overview
 
-Authority Nanos includes several tools to help with development, testing, and debugging.
+Authority includes several tools to help with development, testing, and debugging.
 
 ## Quick Links
 

@@ -1,107 +1,125 @@
 # API Overview
 
-The Authority Kernel provides a set of syscalls for AI agent operations.
+The Authority Kernel exposes a set of syscalls (numbers 1024+) to the single untrusted program running in the VM. Every call is routed through the dispatch pipeline before any effect executes.
 
 ## Syscall Architecture
 
 ```mermaid
 graph TB
     subgraph "User Space"
-        APP[AI Agent Application]
+        APP[Untrusted Program]
         SDK[Authority SDK]
     end
 
     subgraph "Authority Kernel Syscalls"
         direction TB
-        STATE[State Management<br/>1024-1027]
-        TOOLS[Tool Calls<br/>1028-1029]
-        AUDIT[Audit<br/>1030-1031]
+        STATE[State<br/>1024-1027]
+        AUDIT[Audit / Query<br/>1028, 1030]
+        BATCH[Batch<br/>1029]
+        TOOLS[Tool Call<br/>1031]
         CTRL[Control<br/>1032-1036]
-        COG[Cognitive<br/>1037]
-        UX[Deny UX<br/>1040-1042]
+        OUT[Outbound Request<br/>1037]
+        BUD[Budget<br/>1038-1040]
+        ASYNC[Async Outbound<br/>1041-1042]
     end
 
-    subgraph "Processing Pipeline"
-        GATE[Authority Gate]
-        POLICY[Policy Check]
+    subgraph "Dispatch Pipeline"
+        HANDLER["ak_syscall_handler()"]
+        DISPATCH["ak_dispatch()"]
         EXEC[Execute]
         LOG[Audit Log]
     end
 
     APP --> SDK
     SDK --> STATE
-    SDK --> TOOLS
     SDK --> AUDIT
+    SDK --> BATCH
+    SDK --> TOOLS
     SDK --> CTRL
-    SDK --> COG
-    SDK --> UX
+    SDK --> OUT
+    SDK --> BUD
+    SDK --> ASYNC
 
-    STATE --> GATE
-    TOOLS --> GATE
-    AUDIT --> GATE
-    CTRL --> GATE
-    COG --> GATE
-    UX --> GATE
+    STATE --> HANDLER
+    AUDIT --> HANDLER
+    BATCH --> HANDLER
+    TOOLS --> HANDLER
+    CTRL --> HANDLER
+    OUT --> HANDLER
+    BUD --> HANDLER
+    ASYNC --> HANDLER
 
-    GATE --> POLICY
-    POLICY --> EXEC
+    HANDLER --> DISPATCH
+    DISPATCH --> EXEC
     EXEC --> LOG
 
-    style GATE fill:#e74c3c,color:#fff
+    style DISPATCH fill:#e74c3c,color:#fff
     style STATE fill:#3498db,color:#fff
     style TOOLS fill:#9b59b6,color:#fff
     style AUDIT fill:#2ecc71,color:#fff
-    style COG fill:#f39c12,color:#fff
+    style OUT fill:#f39c12,color:#fff
 ```
 
 ## Syscall Categories
 
-### State Management (1024-1027)
+### State Management (1024–1027)
 
 | Syscall | Number | Description |
 |---------|--------|-------------|
 | `AK_SYS_READ` | 1024 | Read heap object |
-| `AK_SYS_ALLOC` | 1025 | Allocate new object |
+| `AK_SYS_ALLOC` | 1025 | Allocate new typed object |
 | `AK_SYS_WRITE` | 1026 | Patch object (CAS) |
 | `AK_SYS_DELETE` | 1027 | Soft-delete object |
 
-### Tools (1028-1029)
+### Audit and Query
 
 | Syscall | Number | Description |
 |---------|--------|-------------|
-| `AK_SYS_CALL` | 1028 | Execute tool |
-| `AK_SYS_BATCH` | 1029 | Atomic batch operation |
+| `AK_SYS_QUERY` | 1028 | Query audit log |
+| `AK_SYS_COMMIT` | 1030 | Force audit log commit |
 
-### Audit (1030-1031)
-
-| Syscall | Number | Description |
-|---------|--------|-------------|
-| `AK_SYS_COMMIT` | 1030 | Force log commit |
-| `AK_SYS_QUERY` | 1031 | Query audit log |
-
-### Control (1032-1036)
+### Batch
 
 | Syscall | Number | Description |
 |---------|--------|-------------|
-| `AK_SYS_SPAWN` | 1032 | Create child agent |
-| `AK_SYS_SEND` | 1033 | Send message |
-| `AK_SYS_RECV` | 1034 | Receive message |
-| `AK_SYS_ASSERT` | 1035 | Assert predicate (halt on fail) |
-| `AK_SYS_RESPOND` | 1036 | Send response to external |
+| `AK_SYS_BATCH` | 1029 | Atomic batch of operations |
 
-### Cognitive (1037)
+### Tools
 
 | Syscall | Number | Description |
 |---------|--------|-------------|
-| `AK_SYS_INFERENCE` | 1037 | LLM gateway |
+| `AK_SYS_CALL` | 1031 | Execute tool (integer-only WASM) |
 
-### Deny UX (1040-1042)
+### Control (1032–1036)
 
 | Syscall | Number | Description |
 |---------|--------|-------------|
-| `AK_SYS_LAST_ERROR` | 1040 | Get last denial info |
-| `AK_SYS_TRACE_RING_READ` | 1041 | Read trace ring buffer |
-| `AK_SYS_POLICY_SUGGEST` | 1042 | Dump policy suggestions |
+| `AK_SYS_SPAWN` | 1032 | Create child workload |
+| `AK_SYS_SEND` | 1033 | Send IPC message |
+| `AK_SYS_RECV` | 1034 | Receive IPC message |
+| `AK_SYS_RESPOND` | 1035 | Send response (DLP applied) |
+| `AK_SYS_ASSERT` | 1036 | Assert predicate (halt on fail) |
+
+### Outbound Request (1037)
+
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `AK_SYS_INFERENCE` | 1037 | Outbound request handler (capability-gated) |
+
+### Budget Introspection (1038–1040)
+
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `AK_SYS_BUDGET_STATUS` | 1038 | Current budget status |
+| `AK_SYS_BUDGET_HISTORY` | 1039 | Historical snapshots |
+| `AK_SYS_BUDGET_BREAKDOWN` | 1040 | Detailed breakdown |
+
+### Async Outbound Request (1041–1042)
+
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `AK_SYS_INFER_ISSUE` | 1041 | Issue outbound HTTP(S) request (non-blocking) |
+| `AK_SYS_INFER_POLL` | 1042 | Poll for outbound result |
 
 ## Error Codes
 
@@ -116,10 +134,10 @@ graph TB
         EXEC[-4400 to -4499<br/>Execution Errors]
     end
 
-    subgraph "Common Error Flows"
-        REQ[Request] --> PARSE{Parse OK?}
-        PARSE -->|No| PROTO
-        PARSE -->|Yes| CAPV{Cap Valid?}
+    subgraph "Pipeline Order"
+        REQ[Request] --> VAL{Valid?}
+        VAL -->|No| PROTO
+        VAL -->|Yes| CAPV{Cap subsumes?}
         CAPV -->|No| CAP
         CAPV -->|Yes| POLV{Policy OK?}
         POLV -->|No| POL
@@ -143,7 +161,7 @@ graph TB
 | Code | Name | Description |
 |------|------|-------------|
 | -4001 | `E_FRAME_TOO_LARGE` | Request exceeds max size |
-| -4002 | `E_SCHEMA_INVALID` | JSON schema validation failed |
+| -4002 | `E_SCHEMA_INVALID` | Request schema validation failed |
 | -4003 | `E_SCHEMA_UNKNOWN` | Unknown schema type |
 
 ### Capability Errors (-4100 to -4199)
@@ -161,9 +179,9 @@ graph TB
 
 | Code | Name | Description |
 |------|------|-------------|
-| -4200 | `E_REPLAY` | Duplicate sequence number |
+| -4200 | `E_REPLAY` | Duplicate/stale sequence number |
 | -4201 | `E_POLICY_DENY` | Policy explicitly denies |
-| -4202 | `E_APPROVAL_REQUIRED` | Human approval needed |
+| -4202 | `E_APPROVAL_REQUIRED` | Approval needed |
 | -4203 | `E_TAINT` | Taint level too high |
 
 ### Resource Errors (-4300 to -4399)
@@ -186,49 +204,47 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI Agent
+    participant App as Program
     participant SDK as Authority SDK
-    participant Gate as Authority Gate
-    participant Exec as Executor
+    participant Handler as ak_syscall_handler
+    participant Dispatch as ak_dispatch
+    participant Exec as Handler
     participant Audit as Audit Log
 
-    Agent->>SDK: Function call
-    SDK->>SDK: Build JSON request
+    App->>SDK: Function call
+    SDK->>SDK: Build request + capability token
 
-    Note over SDK: Request Structure:<br/>pid, run_id, seq,<br/>op, args, cap
+    SDK->>Handler: Syscall (arg1=req, arg5=cap)
+    Handler->>Dispatch: ak_dispatch(ctx, req)
+    Dispatch->>Dispatch: 1 Validate / 2 Anti-replay
+    Dispatch->>Dispatch: 3 Capability (HMAC + scope)
+    Dispatch->>Dispatch: 4 Policy + budget
 
-    SDK->>Gate: Syscall with JSON
-    Gate->>Gate: Parse & Validate
-    Gate->>Gate: Verify Capability
-    Gate->>Gate: Check Policy
-    Gate->>Gate: Check Budget
-
-    alt All Checks Pass
-        Gate->>Exec: Execute operation
-        Exec-->>Gate: Result
-        Gate->>Audit: Log success
-        Audit-->>Gate: seq, hash
-        Gate-->>SDK: Success response
-        SDK-->>Agent: Parsed result
-    else Check Failed
-        Gate->>Audit: Log denial
-        Gate-->>SDK: Error response
-        SDK-->>Agent: Error with fix suggestion
+    alt All Stages Pass
+        Dispatch->>Exec: 5 Execute operation
+        Exec-->>Dispatch: Result
+        Dispatch->>Audit: 6 Log (durable before return)
+        Audit-->>Dispatch: seq, hash
+        Dispatch-->>SDK: Success response
+        SDK-->>App: Parsed result
+    else Stage Failed
+        Dispatch->>Audit: 6 Log denial (durable)
+        Dispatch-->>SDK: Error response
+        SDK-->>App: Error
     end
 ```
 
 ## Request Format
 
-All AK syscalls use JSON request/response:
+The capability token is passed as a serialized token in the syscall's `arg5`; the request payload is passed via `arg1`/`arg2`. A JSON request body looks like:
 
 ```json
 {
-  "pid": "agent-7a3f",
+  "pid": "prog-7a3f",
   "run_id": "2024-01-15T10:30:00Z",
   "seq": 42,
   "op": "WRITE",
-  "args": { ... },
-  "cap": { ... }
+  "args": { ... }
 }
 ```
 
@@ -239,7 +255,7 @@ All AK syscalls use JSON request/response:
   "ok": true,
   "result": { ... },
   "usage": {
-    "tokens": 150,
+    "bytes": 4096,
     "latency_ms": 23
   }
 }
@@ -253,14 +269,12 @@ Or on error:
   "error": {
     "code": -4201,
     "name": "E_POLICY_DENY",
-    "message": "Operation denied by policy",
-    "missing_cap": "fs.write",
-    "suggested_fix": "write = [\"/path/to/file\"]"
+    "message": "Operation denied by policy"
   }
 }
 ```
 
 ## Further Reading
 
-- [Syscalls Reference](/api/syscalls) - Detailed syscall documentation
-- [Effects Reference](/api/effects) - Effect types and authorization
+- [Syscalls Reference](/api/syscalls) — detailed syscall documentation
+- [Effects Reference](/api/effects) — how requests map to policy and capability checks

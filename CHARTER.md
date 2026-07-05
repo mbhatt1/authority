@@ -1,24 +1,28 @@
-# Nano Charter
+# Authority Charter
 
 ## Mission
 
+Provide a unikernel that runs a single untrusted program per virtual machine and
+enforces its security in the kernel — with cryptographic capabilities, a
+tamper-evident audit log, hard resource budgets, and deny-by-default policy — so
+that what the program can do is constrained by the kernel, not by the
+application's own good behavior.
+
 ## Tenets (unless you know better ones)
 
-These tenets guide Nanos' development:
+1. **Enforced, not advised.** Security decisions happen inside the syscall path,
+   before an effect executes. If a request is not provably authorized, it is
+   denied.
 
-1. **Security**:
+2. **Minimalist.** Built on Nanos: one program per VM, no users, no shell, no
+   ambient authority. Keep the kernel small and the attack surface smaller.
 
-Nanos aims to be a much more secure system than Linux. It does this
-through several thrusts. Not having the notion of users, running a
-single process per vm, and limiting the amount of code that is
-incorporated into each vm.
+3. **Provable.** Every operation is recorded in an append-only, hash-chained
+   audit log that is made durable before a response is returned, so the record
+   cannot be silently rewritten.
 
-2. **Minimalist**: 
-
-KISS. As Nanos is not intended to be ran on bare metal we strive to keep
-the core as simple as possible.
-
-3. **Performance**: 
+4. **Honest.** Features are either enforced by the compiled kernel or they are
+   not claimed. Failure modes fail closed.
 
 ## Contributions & Project Roles
 

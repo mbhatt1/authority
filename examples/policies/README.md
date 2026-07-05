@@ -1,21 +1,23 @@
-# Authority Kernel Policy Files
+# Authority Policy Files
 
-This directory contains policy files for each of the Authority SDK examples.
+This directory contains a policy file for each of the Authority SDK examples. A
+policy is deny-by-default: an operation is only permitted if the policy explicitly
+allows it and the caller holds a capability for it.
 
 ## Policy Files
 
 | Policy File | Example | Description |
 |-------------|---------|-------------|
 | `01_heap_policy.json` | `01_heap_operations.py` | Heap operations (alloc, read, write, delete) with budgets |
-| `02_authorization_policy.json` | `02_authorization.py` | File read and HTTP authorization |
+| `02_authorization_policy.json` | `02_authorization.py` | File read and outbound-request authorization |
 | `03_tool_policy.json` | `03_tool_execution.py` | Tool execution (add, concat, file_read) |
-| `04_inference_policy.json` | `04_inference.py` | LLM inference (gpt-4, claude) |
+| `04_inference_policy.json` | `04_inference.py` | Capability-gated outbound requests |
 | `05_audit_policy.json` | `05_audit_logging.py` | Audit log access |
 
 ## Policy Loading
 
-The minops tool automatically detects and loads policy files based on the script name.
-For example, running `01_heap_operations.py` will auto-load `01_heap_policy.json`.
+The minops tool detects and loads a policy file based on the script name.
+For example, running `01_heap_operations.py` auto-loads `01_heap_policy.json`.
 
 Manual override:
 ```bash
@@ -40,7 +42,7 @@ minops run examples/01_heap_operations.py -p examples/policies/01_heap_policy.js
     "deny": ["shell_exec"]
   },
   "infer": {
-    "models": ["gpt-4"],
+    "models": ["default"],
     "max_tokens": 100000
   },
   "budgets": {
@@ -53,26 +55,21 @@ minops run examples/01_heap_operations.py -p examples/policies/01_heap_policy.js
 }
 ```
 
-## Current Status
+The `infer` section gates capability-controlled outbound requests: `models` is
+the allowlist of request targets and `max_tokens` caps the accounting budget per
+request. The `budgets` section sets the hard resource limits the kernel enforces.
 
-**Note:** The Authority SDK examples require a kernel ABI fix to work correctly.
-The issue is a mismatch between libak's syscall argument format and the kernel's
-expected format in `ak_syscall_handler`.
+## How Policy Is Enforced
 
-Basic Python execution works correctly. See `test-simple.py` for a working example.
+Every syscall enters the kernel through `ak_syscall_handler`, which calls
+`ak_dispatch`. `ak_dispatch` runs six stages in order:
 
-### Issue Details
+1. **validate** - check request shape and arguments
+2. **anti-replay** - reject duplicate or replayed requests
+3. **capability** - verify the caller's HMAC capability authorizes the operation
+4. **policy + budget** - evaluate this policy and the resource budgets
+5. **execute** - perform the operation
+6. **audit** - append a hash-chained entry to the tamper-evident audit log
 
-- **libak** passes: `arg0=&request, arg1=&response, arg2=0, arg3=0, arg4=0`
-- **Kernel expects**: `arg0=agent_id|0, arg1=req_buf, arg2=req_len, arg3=resp_buf, arg4=resp_len`
-
-This causes the kernel to misinterpret the request pointer as an agent ID, failing with -ESRCH.
-
-### Resolution
-
-Fix options:
-1. Update libak to use kernel's expected format (serialize requests as JSON buffers)
-2. Update kernel to detect and handle libak's structure format
-3. Create a compatibility layer
-
-Until fixed, Authority SDK features will not work, but basic Python execution functions correctly.
+Policy files are consumed at stage 4. If a policy rule denies an operation, or a
+budget is exhausted, the request is rejected before execution.

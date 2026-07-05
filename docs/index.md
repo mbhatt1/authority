@@ -2,9 +2,9 @@
 layout: home
 
 hero:
-  name: Authority Nanos
-  text: The Only Real Way to Run Computer Use Agents
-  tagline: Production-grade security for agents that control real systems
+  name: Authority
+  text: Capability-Based Security Unikernel
+  tagline: Kernel-enforced security for a single untrusted program per VM, built on Nanos.
   actions:
     - theme: brand
       text: Get Started
@@ -14,50 +14,45 @@ hero:
       link: https://github.com/nanovms/authority-nanos
 
 features:
-  - icon: "🔐"
-    title: Cryptographic Authorization
-    details: HMAC-signed capabilities for every operation. No permission guessing, no ambient authority, no privilege escalation.
-  - icon: "📝"
-    title: Immutable Audit Trail
-    details: Hash-chained logs prove what the agent did (or didn't do). Tamper-evident, compliance-ready, incident-provable.
-  - icon: "🚫"
-    title: Fail-Closed by Default
-    details: Unknown operations denied, not allowed then logged. Zero-trust enforcement before execution, not after.
-  - icon: "🤖"
-    title: Tool Sandboxing
-    details: WASM-isolated tool execution with explicit capability passing. No shell escapes, no system access, no surprises.
-  - icon: "⚡"
-    title: Zero Privilege Escalation
-    details: No users, no sudo, no setuid, no capabilities. Single-process unikernel eliminates entire attack classes.
-  - icon: "🎯"
-    title: Built for Computer Use
-    details: Syscalls designed for autonomous agents controlling production systems, not human operators clicking buttons.
+  - title: Cryptographic Capabilities
+    details: Every effectful syscall requires an unforgeable HMAC-SHA256 capability. No ambient authority, no permission guessing, no privilege escalation.
+  - title: Tamper-Evident Audit Log
+    details: A hash-chained log records every request and result. Any modification breaks the chain and is immediately detectable.
+  - title: Deny-by-Default Policy
+    details: Filesystem, network, and tool access are denied before execution unless a policy rule and capability explicitly allow them.
+  - title: Integer-Only WASM Tool Sandbox
+    details: Tools run in an isolated WASM sandbox with explicit capability passing. The kernel is built -mno-sse, so floating-point tools are rejected.
+  - title: Single-Process Unikernel
+    details: No users, no sudo, no setuid. One program per VM eliminates entire classes of privilege-escalation and container-escape attacks.
+  - title: Hard Resource Budgets
+    details: Pre-admission budget enforcement bounds tokens, tool calls, wall time, and bytes. Consumption never exceeds declared limits.
 ---
 
 ## System Architecture
 
 ```mermaid
 graph TB
-    subgraph "Agent Application"
-        APP[AI Agent Code]
+    subgraph "Untrusted Program"
+        APP[Program Code]
         SDK[Authority SDK]
     end
 
     subgraph "Authority Kernel"
-        GATE[Single Authority Gate]
+        GATE[ak_syscall_handler → ak_dispatch]
 
-        subgraph "Security Layer"
+        subgraph "Enforcement Pipeline"
+            VAL[Request Validation]
+            REPLAY[Anti-Replay]
             CAP[Capability Verifier]
-            POL[Policy Engine]
+            POLBUD[Policy + Budget]
             AUDIT[Audit Logger]
-            BUDGET[Budget Controller]
         end
 
-        subgraph "Effect Handlers"
-            FS[Filesystem Effects]
-            NET[Network Effects]
-            TOOL[Tool Effects]
-            INFER[Inference Effects]
+        subgraph "Handlers"
+            FS[Filesystem]
+            NET[Network]
+            TOOL[WASM Tool]
+            OUT[Outbound Request]
         end
     end
 
@@ -74,81 +69,72 @@ graph TB
 
     APP --> SDK
     SDK --> GATE
-    GATE --> CAP
-    CAP --> POL
-    POL --> BUDGET
-    BUDGET --> AUDIT
-
-    AUDIT --> FS
-    AUDIT --> NET
-    AUDIT --> TOOL
-    AUDIT --> INFER
+    GATE --> VAL
+    VAL --> REPLAY
+    REPLAY --> CAP
+    CAP --> POLBUD
+    POLBUD --> FS
+    POLBUD --> NET
+    POLBUD --> TOOL
+    POLBUD --> OUT
+    FS --> AUDIT
+    NET --> AUDIT
+    TOOL --> AUDIT
+    OUT --> AUDIT
 
     FS --> SYSCALL
     NET --> SYSCALL
     TOOL --> SYSCALL
-    INFER --> SYSCALL
+    OUT --> SYSCALL
 
     SYSCALL --> MEM
     SYSCALL --> SCHED
     SYSCALL --> DRV
 
     DRV --> HV
-
-    style GATE fill:#e74c3c,color:#fff
-    style CAP fill:#3498db,color:#fff
-    style POL fill:#3498db,color:#fff
-    style AUDIT fill:#2ecc71,color:#fff
-    style BUDGET fill:#9b59b6,color:#fff
 ```
 
 ## Request Flow
 
-Every operation in Authority Nanos follows this security pipeline:
+Every effectful syscall enters through `ak_syscall_handler`, which calls `ak_dispatch()`. `ak_dispatch()` runs a fixed six-stage pipeline before any effect is executed:
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI Agent
-    participant Gate as Authority Gate
+    participant Prog as Program
+    participant Disp as ak_dispatch
+    participant Val as Request Validation
+    participant Rep as Anti-Replay
     participant Cap as Capability Check
-    participant Pol as Policy Engine
-    participant Bud as Budget Control
-    participant Aud as Audit Log
+    participant PB as Policy + Budget
     participant Exec as Executor
-    participant Kern as Nanos Kernel
+    participant Aud as Audit Log
 
-    Agent->>Gate: Effect Request
-    Gate->>Gate: Parse & Validate
-    Gate->>Cap: Verify Capability
-
-    alt Invalid Capability
-        Cap-->>Agent: E_CAP_INVALID
+    Prog->>Disp: Syscall (request)
+    Disp->>Val: 1. Validate request
+    alt Malformed
+        Val-->>Prog: E_REQUEST_INVALID
     end
-
-    Cap->>Pol: Check Policy
-
-    alt Policy Deny
-        Pol-->>Agent: E_POLICY_DENY
+    Val->>Rep: 2. Anti-replay check
+    alt Replay detected
+        Rep-->>Prog: E_REPLAY
     end
-
-    Pol->>Bud: Check Budget
-
-    alt Budget Exceeded
-        Bud-->>Agent: E_BUDGET_EXCEEDED
+    Rep->>Cap: 3. Verify capability (HMAC-SHA256)
+    alt Invalid capability
+        Cap-->>Prog: E_CAP_INVALID
     end
-
-    Bud->>Aud: Log Request
-    Aud->>Exec: Execute Operation
-    Exec->>Kern: Syscall
-    Kern-->>Exec: Result
-    Exec->>Aud: Log Response
+    Cap->>PB: 4. Check policy + budget
+    alt Policy deny or budget exceeded
+        PB-->>Prog: E_POLICY_DENY / E_BUDGET_EXCEEDED
+    end
+    PB->>Exec: 5. Execute effect
+    Exec->>Aud: 6. Append to hash-chained audit log
     Aud->>Aud: fsync()
-    Aud-->>Agent: Success Response
+    Aud-->>Prog: Result
 ```
 
-## What is Authority Nanos?
+## What is Authority?
 
-Authority Nanos is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** that adds the **Authority Kernel** — a capability-based security layer purpose-built for running autonomous AI agents in production.
+Authority is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** that adds the **Authority kernel** — a capability-based security layer that runs a single untrusted program per VM and mediates every effect that program performs. It is not a general-purpose OS: one VM runs one program, and the kernel enforces cryptographic authorization, deny-by-default policy, hard budgets, and a tamper-evident audit trail on everything that program does.
 
 ```mermaid
 graph LR
@@ -159,26 +145,19 @@ graph LR
         N4[Filesystem]
     end
 
-    subgraph "Authority Nanos Additions"
+    subgraph "Authority Additions"
         A1[Capability System]
         A2[Policy Engine]
         A3[Audit Logging]
         A4[Budget Control]
-        A5[LLM Gateway]
-        A6[Tool Sandbox]
+        A5[Outbound Request Handler]
+        A6[WASM Tool Sandbox]
     end
 
     N1 --> A1
     N2 --> A2
     N3 --> A5
     N4 --> A3
-
-    style A1 fill:#e74c3c,color:#fff
-    style A2 fill:#3498db,color:#fff
-    style A3 fill:#2ecc71,color:#fff
-    style A4 fill:#9b59b6,color:#fff
-    style A5 fill:#f39c12,color:#fff
-    style A6 fill:#1abc9c,color:#fff
 ```
 
 ## Security Model
@@ -186,10 +165,10 @@ graph LR
 ```mermaid
 flowchart TB
     subgraph "Four Security Invariants"
-        INV1[INV-1: No Bypass<br/>All I/O through kernel]
-        INV2[INV-2: Capability Required<br/>HMAC-signed tokens]
+        INV1[INV-1: No Bypass<br/>All effects through the kernel]
+        INV2[INV-2: Capability Required<br/>HMAC-SHA256 tokens]
         INV3[INV-3: Budget Enforced<br/>Pre-admission control]
-        INV4[INV-4: Audit Committed<br/>Hash-chained logs]
+        INV4[INV-4: Audit Committed<br/>Hash-chained log]
     end
 
     subgraph "Security Guarantees"
@@ -204,11 +183,6 @@ flowchart TB
     INV2 --> G2
     INV4 --> G3
     INV3 --> G4
-
-    style INV1 fill:#e74c3c,color:#fff
-    style INV2 fill:#3498db,color:#fff
-    style INV3 fill:#9b59b6,color:#fff
-    style INV4 fill:#2ecc71,color:#fff
 ```
 
 ## Quick Example
@@ -257,7 +231,7 @@ graph TB
         JETSON[NVIDIA Jetson]
     end
 
-    AUTH[Authority Nanos<br/>Image]
+    AUTH[Authority Image]
 
     AUTH --> DEV
     AUTH --> AWS
@@ -267,8 +241,6 @@ graph TB
     AUTH --> JETSON
 
     DEV --> QEMU
-
-    style AUTH fill:#e74c3c,color:#fff
 ```
 
 ## Project Status
@@ -280,4 +252,4 @@ graph TB
 | Security Invariants (INV-1 to INV-4) | Enforced |
 | Documentation | Active |
 
-See the [roadmap](/architecture/#roadmap) for upcoming features.
+See the [roadmap](/guide/roadmap) for upcoming features.

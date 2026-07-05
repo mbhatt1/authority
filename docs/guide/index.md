@@ -6,9 +6,9 @@ This section contains project-level documentation including our charter, roadmap
 
 - **[Project Charter](./charter.md)** - Our mission, tenets, and development principles
 - **[Roadmap](./roadmap.md)** - Planned features and engineering direction
-- **[Contributing](./contributing.md)** - How to contribute to Authority Nanos
+- **[Contributing](./contributing.md)** - How to contribute to Authority
 - **[Release Notes](./release-notes.md)** - Release process and update information
 
 ## Overview
 
-Authority Nanos is built on security-first principles. This section documents how we approach project development and what you can expect from the project.
+Authority is built on security-first principles. This section documents how we approach project development and what you can expect from the project.

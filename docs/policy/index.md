@@ -1,90 +1,78 @@
 # Policy Overview
 
-The Authority Kernel uses a **deny-by-default** policy model:
+The Authority kernel uses a **deny-by-default** policy model:
 
-- If no policy is loaded, ALL operations are denied
+- If no policy is loaded, ALL gated operations are denied
 - If a policy is loaded, only explicitly allowed operations succeed
-- Missing rules for a category = deny that category
+- An unmatched tool or domain = deny
+
+The compiled policy engine is `src/agentic/ak_policy.c`, which parses **JSON**. This page describes the schema that engine actually parses.
 
 ## Policy Evaluation Flow
 
 ```mermaid
 flowchart TD
-    REQ[Effect Request] --> LOAD{Policy Loaded?}
+    REQ[Request] --> LOAD{Policy Loaded?}
 
-    LOAD -->|No| DENY1[DENY<br/>No policy found]
-    LOAD -->|Yes| MATCH{Pattern Match?}
+    LOAD -->|No| DENY1[DENY<br/>No policy]
+    LOAD -->|Yes| MATCH{Rule Match?}
 
-    MATCH -->|No Match| DENY2[DENY<br/>No rule covers request]
-    MATCH -->|Match Found| RULE{Rule Decision?}
-
-    RULE -->|DENY| DENY3[DENY<br/>Explicit deny rule]
-    RULE -->|ALLOW| BUDGET{Budget OK?}
-    RULE -->|REQUIRE_APPROVAL| APPROVE[Wait for Approval]
+    MATCH -->|No Match| DENY2[DENY<br/>Nothing allows it]
+    MATCH -->|Explicit deny| DENY3[DENY<br/>Deny rule]
+    MATCH -->|Allow| BUDGET{Budget OK?}
 
     BUDGET -->|Exceeded| DENY4[DENY<br/>Budget exceeded]
-    BUDGET -->|OK| ALLOW[ALLOW<br/>Execute operation]
+    BUDGET -->|OK| ALLOW[ALLOW]
 
     style DENY1 fill:#c0392b,color:#fff
     style DENY2 fill:#c0392b,color:#fff
     style DENY3 fill:#c0392b,color:#fff
     style DENY4 fill:#c0392b,color:#fff
     style ALLOW fill:#27ae60,color:#fff
-    style APPROVE fill:#f39c12,color:#fff
 ```
 
-## Policy Structure
+## Policy Structure (compiled schema)
 
 ```mermaid
 graph TB
     subgraph "Policy File"
-        VER[version: 1.0]
-
-        subgraph FS[Filesystem Rules]
-            FS_R[read: patterns]
-            FS_W[write: patterns]
-        end
-
-        subgraph NET[Network Rules]
-            NET_DNS[dns: domains]
-            NET_CON[connect: targets]
-            NET_BIND[bind: addresses]
-            NET_LIST[listen: addresses]
-        end
+        VER[version]
+        SIG[signature: optional HMAC]
 
         subgraph TOOLS[Tool Rules]
             T_ALLOW[allow: names]
             T_DENY[deny: names]
         end
 
-        subgraph INFER[Inference Rules]
-            I_MODELS[models: patterns]
-            I_TOKENS[max_tokens: limit]
+        subgraph DOMAINS[Domain Rules]
+            D_ALLOW[allow: patterns]
+            D_DENY[deny: patterns]
+        end
+
+        subgraph TAINT[Taint Rules]
+            TA_SRC[sources]
+            TA_SINK[sinks]
+            TA_SAN[sanitizers]
         end
 
         subgraph BUDGETS[Budget Limits]
-            B_CALLS[tool_calls]
+            B_CALLS[calls]
             B_TOKENS[tokens]
-            B_TIME[wall_time_ms]
+            B_TIME[inference_ms]
         end
-
-        PROFILES[profiles: includes]
     end
 
     style VER fill:#3498db,color:#fff
-    style FS fill:#2ecc71,color:#fff
-    style NET fill:#9b59b6,color:#fff
     style TOOLS fill:#e74c3c,color:#fff
-    style INFER fill:#f39c12,color:#fff
+    style DOMAINS fill:#9b59b6,color:#fff
+    style TAINT fill:#f39c12,color:#fff
     style BUDGETS fill:#1abc9c,color:#fff
 ```
 
-## Policy Formats
+## Policy Format
 
-Authority Nanos supports two policy formats:
-
-- [JSON Format](/policy/json-format) - Primary format for P0
-- [TOML Format](/policy/toml-format) - Human-friendly alternative (P1)
+- [JSON Format](/policy/json-format) - The format parsed by the compiled engine
+- [TOML Format](/policy/toml-format) - A planned human-friendly alternative (not yet in the kernel build)
 
 ## Policy Location
 
@@ -123,7 +111,7 @@ cp policy.json initrd/ak/policy.json
 
 ### Production (Embedded)
 
-Compile policy into the kernel image:
+Compile the policy into the kernel image:
 
 ```makefile
 CFLAGS += -DCONFIG_AK_EMBEDDED_POLICY=1
@@ -131,55 +119,29 @@ CFLAGS += -DCONFIG_AK_EMBEDDED_POLICY=1
 
 ## Pattern Matching
 
+Tool and domain rules use glob patterns. Deny rules take precedence over allow.
+
 ```mermaid
 graph TB
-    subgraph "Filesystem Pattern Matching"
-        PATH[/app/data/file.txt]
-
-        P1["/app/**"] -->|MATCH| PATH
-        P2["/app/data/*"] -->|MATCH| PATH
-        P3["/app/data/file.txt"] -->|MATCH| PATH
-        P4["/tmp/**"] -->|NO MATCH| PATH
+    subgraph "Tool Pattern Matching"
+        TOOL[http_get]
+        P1["http_*"] -->|MATCH| TOOL
+        P2["http_get"] -->|MATCH| TOOL
+        P3["shell_*"] -->|NO MATCH| TOOL
     end
 
-    subgraph "Network Pattern Matching"
-        TARGET[dns:api.github.com:443]
-
-        N1["dns:api.github.com:443"] -->|MATCH| TARGET
-        N2["dns:*.github.com:443"] -->|MATCH| TARGET
-        N3["dns:*:443"] -->|MATCH| TARGET
-        N4["ip:*:443"] -->|NO MATCH| TARGET
+    subgraph "Domain Pattern Matching"
+        DOM[api.github.com]
+        N1["api.github.com"] -->|MATCH| DOM
+        N2["*.github.com"] -->|MATCH| DOM
+        N3["*.internal"] -->|NO MATCH| DOM
     end
 
-    style PATH fill:#3498db,color:#fff
-    style TARGET fill:#9b59b6,color:#fff
+    style TOOL fill:#3498db,color:#fff
+    style DOM fill:#9b59b6,color:#fff
 ```
 
 ## Quick Reference
-
-### Filesystem Rules
-
-```json
-{
-  "fs": {
-    "read": ["/app/**", "/lib/**"],
-    "write": ["/tmp/**"]
-  }
-}
-```
-
-### Network Rules
-
-```json
-{
-  "net": {
-    "dns": ["api.github.com", "*.googleapis.com"],
-    "connect": ["dns:api.github.com:443", "ip:10.0.0.0/8:5432"],
-    "bind": ["ip:0.0.0.0:8080"],
-    "listen": ["ip:0.0.0.0:8080"]
-  }
-}
-```
 
 ### Tool Rules
 
@@ -192,13 +154,15 @@ graph TB
 }
 ```
 
-### Inference Rules
+### Domain Rules
+
+Domains gate outbound destinations.
 
 ```json
 {
-  "infer": {
-    "models": ["gpt-4", "claude-*"],
-    "max_tokens": 100000
+  "domains": {
+    "allow": ["*.github.com", "api.example.com"],
+    "deny": ["*.internal"]
   }
 }
 ```
@@ -208,9 +172,10 @@ graph TB
 ```json
 {
   "budgets": {
-    "tool_calls": 100,
+    "calls": 100,
     "tokens": 100000,
-    "wall_time_ms": 300000
+    "inference_ms": 60000,
+    "file_bytes": 10485760
   }
 }
 ```
@@ -219,12 +184,12 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Agent
-    participant Gate as Authority Gate
-    participant Budget as Budget Controller
+    participant Program
+    participant Gate as ak_dispatch
+    participant Budget as Budget Tracker
     participant Op as Operation
 
-    Agent->>Gate: Request (cost=10 tokens)
+    Program->>Gate: Request (cost=10)
     Gate->>Budget: Check budget
 
     Budget->>Budget: current=90, limit=100
@@ -234,71 +199,32 @@ sequenceDiagram
         Budget-->>Gate: OK
         Gate->>Op: Execute
         Op-->>Gate: Success
-        Gate->>Budget: Commit cost
-        Budget->>Budget: current = 100
-        Gate-->>Agent: Success
+        Gate->>Budget: Commit cost (atomic)
+        Gate-->>Program: Success
     else Exceeds Budget
         Budget-->>Gate: E_BUDGET_EXCEEDED
-        Gate-->>Agent: Error (budget exceeded)
+        Gate-->>Program: Error (budget exceeded)
     end
-```
-
-## Profile Inheritance
-
-```mermaid
-graph TB
-    subgraph "Built-in Profiles"
-        TIER1[tier1-musl<br/>Minimal]
-        TIER2[tier2-glibc<br/>Dynamic linking]
-    end
-
-    subgraph "User Policy"
-        USER[User Rules]
-        PROFILES[profiles: tier1-musl]
-    end
-
-    subgraph "Effective Policy"
-        MERGED[Merged Rules]
-    end
-
-    TIER1 --> MERGED
-    USER --> MERGED
-    PROFILES -.->|includes| TIER1
-
-    style TIER1 fill:#3498db,color:#fff
-    style TIER2 fill:#9b59b6,color:#fff
-    style MERGED fill:#2ecc71,color:#fff
 ```
 
 ## Denial Debugging
 
 ```mermaid
 sequenceDiagram
-    participant Agent
+    participant Program
     participant AK as Authority Kernel
     participant Console
     participant LastError as Last Error Buffer
 
-    Agent->>AK: open("/etc/secret", O_RDONLY)
-    AK->>AK: Check policy
-    AK->>AK: No match for /etc/secret
-
-    AK->>Console: AK DENY FS_OPEN /etc/secret...
+    Program->>AK: gated operation
+    AK->>AK: No matching allow rule
+    AK->>Console: AK DENY ... missing ...
     AK->>LastError: Store denial details
+    AK-->>Program: -EACCES
 
-    AK-->>Agent: -EACCES
-
-    Agent->>AK: syscall(AK_SYS_LAST_ERROR)
+    Program->>AK: syscall(AK_SYS_LAST_ERROR)
     AK->>LastError: Read stored denial
-    LastError-->>Agent: JSON with details
-```
-
-### Console Messages
-
-When an operation is denied:
-
-```
-AK DENY FS_OPEN /etc/secret missing fs.read. Fix: read = ["/etc/secret"]
+    LastError-->>Program: JSON with details
 ```
 
 ### Last Error Syscall
@@ -309,27 +235,15 @@ syscall(AK_SYS_LAST_ERROR, buf, sizeof(buf));
 // buf contains JSON with denial details
 ```
 
-### Record Mode
-
-Run with `AK_RECORD=1` to accumulate suggestions:
-
-```bash
-AK_RECORD=1 ./myapp
-```
-
 ## Validation
 
-P0 validates:
-- Version field present and correct
-- All patterns are valid strings
-- All numbers are valid integers
-- No unknown fields (warning)
+The parser validates:
+- `version` field present
+- All patterns are valid strings within bounds
+- Numeric budget values parse without overflow
+- Trailing garbage after the top-level object is rejected (fail-closed)
+- Unknown members are skipped
 
-### Common Errors
+### Not Yet in the Compiled Engine
 
-| Error | Cause | Fix |
-|-------|-------|-----|
-| "Missing version" | No version field | Add `"version": "1.0"` |
-| "Invalid JSON" | Syntax error | Check JSON syntax |
-| "Pattern too long" | Pattern > 256 chars | Shorten pattern |
-| "Invalid CIDR" | Bad CIDR format | Check format |
+Path-level filesystem rules (`fs.read`/`fs.write`), structured network rules (`net.connect`/`net.dns`/`bind`/`listen`), `wasm`, `infer`, and `profiles` sections are **not** parsed by `ak_policy.c`. They belong to the effect layer that is not in the current kernel build. Do not rely on them.

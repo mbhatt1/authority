@@ -1,10 +1,10 @@
 # Testing Documentation
 
-This section contains documentation for the testing infrastructure for Authority Nanos.
+This section documents the testing infrastructure for Authority.
 
 ## Overview
 
-Authority Nanos uses a comprehensive testing strategy covering:
+Authority uses a testing strategy covering:
 
 - **Unit Tests** - Test individual components in isolation
 - **Integration Tests** - Test system behavior across components

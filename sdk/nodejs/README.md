@@ -1,18 +1,19 @@
 # @authority/nanos - Node.js SDK
 
-Capability-based security for AI agents running on Authority Nanos.
+Capability-based security for programs running under Authority.
 
 ## Overview
 
-Authority Nanos is a purpose-built unikernel for securing autonomous AI agents with:
+Authority is a capability-based security unikernel, built on Nanos, that runs a
+single untrusted program per VM and enforces its security in the kernel:
 
-- **Cryptographic Capabilities**: HMAC-signed tokens for every operation
-- **Immutable Audit Trail**: Hash-chained append-only log
-- **Budget Enforcement**: Hard kernel limits on tokens, tool calls, wall time
-- **Tool Sandboxing**: WASM execution with capability gating
-- **Zero Ambient Authority**: No inherited permissions, everything requires explicit capability
+- **Cryptographic Capabilities**: HMAC-signed authorization for every operation
+- **Immutable Audit Trail**: Hash-chained, append-only log
+- **Budget Enforcement**: Hard kernel limits on tokens, tool calls, wall time, and bytes
+- **Tool Sandboxing**: Integer-only WASM execution, capability-gated
+- **Zero Ambient Authority**: No inherited permissions; every operation requires an explicit capability
 
-This SDK provides a Node.js/TypeScript API to interact with the Authority Kernel.
+This SDK provides a Node.js/TypeScript API for interacting with the Authority kernel.
 
 ## Installation
 
@@ -25,11 +26,11 @@ npm install @authority/nanos
 ```typescript
 import { AuthorityKernel } from '@authority/nanos';
 
-// Create and initialize kernel
+// Create and initialize the kernel connection
 await using ak = new AuthorityKernel();
 await ak.init();
 
-// Allocate object in typed heap
+// Allocate an object in the typed heap
 const handle = await ak.alloc('counter', { value: 0 });
 
 // Read it back
@@ -52,9 +53,9 @@ await ak.delete(handle);
 Store and manage versioned objects with compare-and-swap semantics:
 
 ```typescript
-const handle = await ak.alloc('conversation', {
-  messages: [],
-  context: 'default'
+const handle = await ak.alloc('record', {
+  items: [],
+  label: 'default'
 });
 
 const data = await ak.read(handle);
@@ -62,13 +63,13 @@ const obj = JSON.parse(new TextDecoder().decode(data));
 
 // Update with JSON Patch (RFC 6902)
 const newVersion = await ak.write(handle, [
-  { op: 'add', path: '/messages/-', value: { role: 'user', content: 'Hello' } }
+  { op: 'add', path: '/items/-', value: { id: 1, name: 'first' } }
 ]);
 ```
 
 ### Authorization
 
-Check if operations are permitted by policy:
+Check whether an operation is permitted by policy:
 
 ```typescript
 // Simple boolean check
@@ -87,28 +88,30 @@ console.log(details);
 // }
 ```
 
-### LLM Inference
+### Outbound Requests
 
-Make LLM calls through the Authority gateway (budget-enforced):
+Issue a capability-gated outbound request through the kernel. The kernel only
+issues the request if policy and the caller's capability permit it, and it is
+charged against the resource budget:
 
 ```typescript
 const response = await ak.inference({
-  model: 'gpt-4',
+  model: 'default',
   messages: [
-    { role: 'system', content: 'You are helpful' },
-    { role: 'user', content: 'What is 2+2?' }
+    { role: 'system', content: 'context' },
+    { role: 'user', content: 'payload' }
   ],
   max_tokens: 100,
   temperature: 0.7
 });
 
 const result = JSON.parse(new TextDecoder().decode(response));
-console.log(result.choices[0].message.content);
+console.log(result);
 ```
 
 ### File I/O
 
-Read and write files (controlled by policy):
+Read and write files, controlled by policy:
 
 ```typescript
 // Read
@@ -121,7 +124,7 @@ await ak.fileWrite('/tmp/output.txt', 'Hello, World!');
 
 ### Audit Logging
 
-Log events to the immutable audit trail:
+Append events to the immutable audit trail:
 
 ```typescript
 await ak.auditLog('user_action', {
@@ -130,7 +133,7 @@ await ak.auditLog('user_action', {
   timestamp: Date.now()
 });
 
-// Query audit log
+// Query the audit log
 const result = await ak.auditQuery({
   event_type: 'user_action',
   limit: 100
@@ -141,7 +144,7 @@ console.log(result.entries);
 
 ### Budget Tracking
 
-Monitor resource consumption:
+Read the kernel's hard resource budgets:
 
 ```typescript
 const status = await ak.getBudgetStatus();
@@ -196,10 +199,10 @@ const ak = new AuthorityKernel({
   // Syscall timeout in milliseconds
   syscallTimeout: 30000,
 
-  // Max size for single heap object (bytes)
+  // Max size for a single heap object (bytes)
   maxObjectSize: 10 * 1024 * 1024,
 
-  // Max response size for LLM inference (bytes)
+  // Max response size for an outbound request (bytes)
   maxInferenceSize: 100 * 1024 * 1024
 });
 
@@ -210,20 +213,20 @@ await ak.shutdown();
 
 ### Environment Variables
 
-- `LIBAK_PATH`: Override library path (default: auto-detect)
+- `LIBAK_PATH`: Override the library path (default: auto-detect)
 
 ## Running with minops
 
-Use the `minops` tool to run Node.js applications in the Authority Nanos unikernel:
+Use the `minops` tool to run a Node.js program in the Authority unikernel:
 
 ```bash
 minops run app.js -p policy.json --allow-llm -m 512
 ```
 
 Where:
-- `app.js`: Your Node.js application
+- `app.js`: Your Node.js program
 - `policy.json`: Security policy file
-- `--allow-llm`: Allow common LLM API endpoints
+- `--allow-llm`: Permit the built-in set of common outbound endpoints
 - `-m 512`: Allocate 512MB memory
 
 ## Examples
@@ -266,22 +269,22 @@ npm run test:watch
 
 #### Methods
 
-- `init(): Promise<void>` - Initialize kernel
-- `shutdown(): Promise<void>` - Shutdown kernel
-- `alloc(typeName: string, initialValue: any): Promise<Handle>` - Allocate heap object
-- `read(handle: Handle): Promise<Buffer>` - Read heap object
-- `write(handle: Handle, patch: JsonPatchOp[]): Promise<number>` - Update heap object
-- `delete(handle: Handle): Promise<void>` - Delete heap object
+- `init(): Promise<void>` - Initialize the kernel connection
+- `shutdown(): Promise<void>` - Shut down the kernel connection
+- `alloc(typeName: string, initialValue: any): Promise<Handle>` - Allocate a heap object
+- `read(handle: Handle): Promise<Buffer>` - Read a heap object
+- `write(handle: Handle, patch: JsonPatchOp[]): Promise<number>` - Update a heap object
+- `delete(handle: Handle): Promise<void>` - Delete a heap object
 - `authorize(operation: string, target: string): Promise<boolean>` - Check authorization
 - `authorizeDetails(operation: string, target: string): Promise<AuthorizationDetails>` - Get auth details
-- `fileRead(path: string, maxSize?: number): Promise<Buffer>` - Read file
-- `fileWrite(path: string, data: Buffer | string): Promise<void>` - Write file
-- `inference(request: InferenceRequest): Promise<Buffer>` - LLM inference
-- `auditLog(eventType: string, details?: any): Promise<void>` - Write audit log
-- `auditQuery(query?: any): Promise<AuditQueryResult>` - Query audit log
-- `getBudgetStatus(): Promise<BudgetStatus>` - Get resource budget status
-- `getLastDenial(): Promise<DenialInfo | null>` - Get last denial info
-- `toolCall(toolName: string, args: any): Promise<Buffer>` - Execute WASM tool
+- `fileRead(path: string, maxSize?: number): Promise<Buffer>` - Read a file
+- `fileWrite(path: string, data: Buffer | string): Promise<void>` - Write a file
+- `inference(request: InferenceRequest): Promise<Buffer>` - Issue a capability-gated outbound request
+- `auditLog(eventType: string, details?: any): Promise<void>` - Append an audit entry
+- `auditQuery(query?: any): Promise<AuditQueryResult>` - Query the audit log
+- `getBudgetStatus(): Promise<BudgetStatus>` - Read the resource budget status
+- `getLastDenial(): Promise<DenialInfo | null>` - Get the last denial info
+- `toolCall(toolName: string, args: any): Promise<Buffer>` - Execute a WASM tool
 
 ### Error Classes
 
@@ -300,8 +303,8 @@ npm run test:watch
 
 See `src/types.ts` for complete type definitions:
 
-- `Handle` - Reference to heap object
-- `InferenceRequest` - LLM request parameters
+- `Handle` - Reference to a heap object
+- `InferenceRequest` - Outbound request parameters
 - `AuthorizationDetails` - Authorization decision details
 - `BudgetStatus` - Resource budget information
 - `AuditEntry` - Audit log entry
@@ -309,18 +312,18 @@ See `src/types.ts` for complete type definitions:
 
 ## Performance
 
-- **Syscall overhead**: ~5-10μs per call
+- **Syscall overhead**: ~5-10us per call
 - **Memory usage**: ~30MB baseline (Node.js/V8)
-- **Event throughput**: 1000+ ops/sec
+- **Throughput**: 1000+ ops/sec
 - **Audit log**: Hash-chain with tamper detection
 
 ## Security Considerations
 
 1. **Never hardcode credentials** - Use policies and capabilities
 2. **Validate all inputs** - Check authorization before operations
-3. **Monitor budget** - Prevent resource exhaustion
+3. **Monitor the budget** - Prevent resource exhaustion
 4. **Review audit logs** - Detect anomalies
-5. **Use strong policies** - Apply principle of least privilege
+5. **Use strong policies** - Apply the principle of least privilege
 
 ## Development
 
@@ -350,7 +353,7 @@ npm run docs
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are welcome. Please:
 
 1. Fork the repository
 2. Create a feature branch
@@ -364,7 +367,7 @@ Apache License 2.0
 
 ## Support
 
-- **Documentation**: [Authority Nanos Docs](https://github.com/authority-systems/nanos)
+- **Documentation**: [Authority Docs](https://github.com/authority-systems/nanos)
 - **Issues**: [GitHub Issues](https://github.com/authority-systems/nanos/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/authority-systems/nanos/discussions)
 
@@ -376,9 +379,9 @@ Apache License 2.0
 - Typed heap operations (alloc, read, write, delete)
 - Authorization and policy enforcement
 - File I/O operations
-- LLM inference gateway
+- Capability-gated outbound requests
 - Audit logging and queries
 - Budget tracking
-- Comprehensive error handling
+- Error handling
 - Full TypeScript support
 - Unit tests

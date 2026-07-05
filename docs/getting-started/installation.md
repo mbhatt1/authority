@@ -1,8 +1,8 @@
 # Installation
 
-**Get Started Running Computer Use Agents Securely**
+**Install Authority and Build the Kernel**
 
-Authority Nanos provides the cryptographic authorization and immutable audit trails required when AI agents control production systems.
+Authority provides the cryptographic authorization, deny-by-default policy, and tamper-evident audit trail that constrain a single untrusted program running in its own VM.
 
 ## Installation Methods
 
@@ -11,7 +11,7 @@ flowchart TB
     subgraph "Option 1: authority CLI (Recommended)"
         OPS_CURL[curl authority.dev/get.sh]
         OPS_INSTALL[authority installed]
-        OPS_READY[Ready to build agents]
+        OPS_READY[Ready to build images]
 
         OPS_CURL --> OPS_INSTALL --> OPS_READY
     end
@@ -31,13 +31,13 @@ flowchart TB
 
 ## Using authority CLI (Recommended)
 
-The fastest way to get started with Authority Nanos is using the `authority` CLI:
+The fastest way to get started with Authority is using the `authority` CLI:
 
 ```bash
 curl https://authority.dev/get.sh -sSfL | sh
 ```
 
-This installs both the authority CLI and the Authority Nanos kernel.
+This installs both the authority CLI and the Authority kernel.
 
 ## Building from Source
 
@@ -64,14 +64,14 @@ curl https://authority.dev/get.sh -sSfL | sh
 git clone https://github.com/nanovms/authority-nanos.git
 cd authority-nanos/nanos
 
-# Build kernel with Authority Kernel enabled (default)
-make kernel
+# Build the kernel for x86_64 (Authority kernel enabled by default)
+make PLATFORM=pc CROSS_COMPILE=x86_64-elf- kernel
 
-# Or build everything (kernel + klibs)
-make
+# Build the kernel for ARM64
+make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- kernel
 ```
 
-The Authority Kernel is enabled by default via `CONFIG_AK_ENABLED=1`.
+The Authority kernel is enabled by default via `CONFIG_AK_ENABLED=1`.
 
 ### Verify the Build
 
@@ -79,7 +79,7 @@ The Authority Kernel is enabled by default via `CONFIG_AK_ENABLED=1`.
 # Run tests
 make test
 
-# Run Authority Kernel specific tests
+# Run Authority kernel specific tests
 cd src/agentic && make test
 ```
 
@@ -100,7 +100,7 @@ graph TB
         ARM_CLOUD[AWS Graviton<br/>Azure Ampere]
     end
 
-    AUTH[Authority Nanos]
+    AUTH[Authority]
 
     AUTH --> X86_LINUX
     AUTH --> X86_MAC
@@ -119,13 +119,13 @@ graph TB
 
 - Full hardware support on Linux with KVM acceleration
 - Deployed on AWS (c5/c6), GCE (n2/c2), Azure (Dv3/Ev3)
-- Build with: `make kernel PLATFORM=pc`
+- Build with: `make PLATFORM=pc CROSS_COMPILE=x86_64-elf- kernel`
 
 ### ARM64 (aarch64)
 
 - Complete implementation with HVF acceleration on macOS
 - Runs on Apple Silicon Macs (M1/M2/M3), Raspberry Pi 4, AWS Graviton, Azure Ampere
-- Build with: `make kernel PLATFORM=virt`
+- Build with: `make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- kernel`
 
 ::: warning macOS Intel (x86_64) Support
 macOS Intel builds are no longer actively tested in CI. For x86_64 development, use Linux with KVM acceleration.
@@ -154,4 +154,4 @@ authority-nanos/
 ## Next Steps
 
 - [Quick Start](/getting-started/) - Create your first policy
-- [First Agent](/getting-started/first-agent) - Build an AI agent
+- [First Program](/getting-started/first-agent) - Build and run your first program

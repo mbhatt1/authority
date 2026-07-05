@@ -1,6 +1,6 @@
-# Cross-Compilation Setup for Authority Nanos
+# Cross-Compilation Setup for Authority
 
-Authority Nanos can be built FOR multiple target architectures (x86_64, aarch64, riscv64) FROM any host platform (macOS, Linux).
+Authority can be built FOR multiple target architectures (x86_64, aarch64, riscv64) FROM any host platform (macOS, Linux).
 
 ## Quick Start
 
@@ -21,13 +21,13 @@ Examples:
 
 ```bash
 # x86_64 (Intel/AMD 64-bit)
-make PLATFORM=pc ARCH=x86_64 libak kernel
+make PLATFORM=pc CROSS_COMPILE=x86_64-elf- ARCH=x86_64 libak kernel
 
 # aarch64 (ARM 64-bit)
-make PLATFORM=virt ARCH=aarch64 libak kernel
+make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- libak kernel
 
 # riscv64 (RISC-V 64-bit)
-make PLATFORM=riscv-virt ARCH=riscv64 libak kernel
+make PLATFORM=riscv-virt ARCH=riscv64 CROSS_COMPILE=riscv64-elf- libak kernel
 ```
 
 ## Installation: macOS
@@ -181,10 +181,10 @@ aarch64-elf-gcc -dumpmachine  # Shows target triple
 ### Build All Platforms At Once
 
 ```bash
-make PLATFORM=pc ARCH=x86_64 && \
-make PLATFORM=virt ARCH=aarch64 && \
-make PLATFORM=riscv-virt ARCH=riscv64 && \
-echo "✅ All platforms built successfully"
+make PLATFORM=pc CROSS_COMPILE=x86_64-elf- ARCH=x86_64 kernel && \
+make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- kernel && \
+make PLATFORM=riscv-virt ARCH=riscv64 CROSS_COMPILE=riscv64-elf- kernel && \
+echo "All platforms built successfully"
 ```
 
 ## Performance Notes

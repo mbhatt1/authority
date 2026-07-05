@@ -1,6 +1,7 @@
-# Authority Nanos Jupyter Notebooks
+# Authority Jupyter Notebooks
 
-Interactive tutorials for learning the Authority Nanos Python SDK.
+Interactive tutorials for learning the Authority Python SDK - writing programs
+that run under Authority.
 
 ## Prerequisites
 
@@ -14,7 +15,7 @@ Interactive tutorials for learning the Authority Nanos Python SDK.
    pip install jupyter
    ```
 
-2. Install the Authority Nanos SDK:
+2. Install the Authority SDK:
    ```bash
    pip install authority-nanos
    ```
@@ -43,14 +44,14 @@ Then navigate to the `notebooks/` directory and open any notebook.
 
 ### 01_getting_started.ipynb
 
-**Introduction to Authority Nanos**
+**Introduction to Authority**
 
-- What is Authority Nanos
+- What Authority is
 - Installing the SDK
 - Hello World example
 - Basic heap operations (alloc, read, write, delete)
 
-Start here if you're new to Authority Nanos.
+Start here if you are new to Authority.
 
 ### 02_authorization.ipynb
 
@@ -62,41 +63,41 @@ Start here if you're new to Authority Nanos.
 - Handling authorization denials
 - Pattern-based policies (advanced)
 
-Learn how to secure your applications with fine-grained access control.
+Learn how to secure a program with fine-grained access control.
 
 ### 03_building_agents.ipynb
 
-**Building AI Agents**
+**Building a Program: Tools and Outbound Requests**
 
-- Agent architecture overview
-- Tool execution through the kernel
-- LLM inference
-- Building an agent loop
-- Agent state management
-- Handling policy constraints
+- Structuring a program that runs under Authority
+- Executing sandboxed WASM tools through the kernel
+- Issuing capability-gated outbound requests
+- Building a work loop
+- Managing program state in the typed heap
+- Handling policy constraints and denials
 
-Build secure AI agents that respect authorization boundaries.
+Build a program whose tool calls and outbound requests are mediated by the kernel.
 
 ### 04_langchain_integration.ipynb
 
-**LangChain Integration**
+**Integrating an External Library**
 
-- Setting up LangChain with Authority Nanos
-- Running LLM calls through the kernel
-- Creating policy-controlled tools
-- Building a secure LangChain agent
-- Agent memory with typed heap
+- Using a third-party library from a program running under Authority
+- Routing the library's outbound requests through the kernel
+- Exposing tools that are gated by policy
+- Keeping program state in the typed heap
 
-Integrate Authority Nanos with the popular LangChain framework.
+Shows how an existing library can run under Authority so its outbound requests
+and tool calls are subject to policy, capabilities, and budgets.
 
 ## Simulation Mode
 
 All notebooks use **simulation mode** by default (`simulate=True`). This means:
 
 - No kernel binary required
-- No LLM API keys needed
+- No external endpoints or credentials needed
 - All operations run in-memory
-- Perfect for learning and testing
+- Convenient for learning and testing
 
 To run against a real kernel, change `simulate=True` to `simulate=False`:
 
@@ -114,7 +115,7 @@ with AuthorityKernel(simulate=False) as ak:
 
 1. **Run cells in order**: Each notebook is designed to be run top-to-bottom.
 
-2. **Restart kernel if stuck**: If something goes wrong, use Kernel > Restart.
+2. **Restart the kernel if stuck**: If something goes wrong, use Kernel > Restart.
 
 3. **Check the SDK docs**: For more details, see the [documentation](https://authority-systems.github.io/nanos/).
 
@@ -131,11 +132,11 @@ pip install authority-nanos
 
 ### Kernel not found
 
-Make sure you're using a Python kernel that has the SDK installed.
+Make sure you are using a Python kernel that has the SDK installed.
 
 ### Simulation mode not working
 
-Ensure you're passing `simulate=True` to `AuthorityKernel()`.
+Ensure you are passing `simulate=True` to `AuthorityKernel()`.
 
 ## Further Reading
 

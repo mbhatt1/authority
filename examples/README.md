@@ -1,10 +1,10 @@
-# Authority Nanos Python SDK Examples
+# Authority Python SDK Examples
 
-This directory contains example scripts demonstrating the Authority Nanos Python SDK capabilities.
+This directory contains example scripts demonstrating the Authority Python SDK. Each example is a small program that runs under Authority and exercises one part of the kernel's API.
 
 ## Quick Start
 
-All examples run in **simulation mode by default** - no kernel build or setup required!
+All examples run in **simulation mode by default** - no kernel build or setup required.
 
 ```bash
 # Install the SDK
@@ -23,9 +23,9 @@ Examples run in simulation mode by default, which:
 
 - **Works out of the box** - No kernel build, no configuration
 - **Full API coverage** - All SDK methods work correctly
-- **In-memory implementation** - Heap, audit logs, authorization all simulated
-- **Great for learning** - Understand the API without infrastructure setup
-- **CI/CD friendly** - Tests run anywhere Python runs
+- **In-memory implementation** - Heap, audit log, and authorization are all simulated
+- **Good for learning** - Understand the API without infrastructure setup
+- **CI-friendly** - Tests run anywhere Python runs
 
 ```bash
 # These run in simulation mode
@@ -35,7 +35,7 @@ python3 examples/01_heap_operations.py
 
 ### Real Kernel Mode
 
-To run against the actual Authority Kernel, use the `--real` or `--kernel` flag:
+To run against the actual Authority kernel, use the `--real` or `--kernel` flag:
 
 ```bash
 # Run with real kernel
@@ -44,15 +44,15 @@ python3 examples/02_authorization.py --kernel
 ```
 
 Requirements for real kernel mode:
-- Built Authority Kernel (`make -j$(nproc)`)
-- libak.so available in library path
+- Built Authority kernel (`make -j$(nproc)`)
+- `libak` available in the library path
 - Kernel running or accessible
 
 ## Examples
 
 ### 0. Hello World (`00_hello_world.py`)
 
-The simplest possible example - allocates one object, reads it, prints success.
+The simplest possible example: allocates one object, reads it, prints success.
 Under 30 lines of code with clear comments.
 
 ```bash
@@ -61,12 +61,12 @@ python3 examples/00_hello_world.py
 
 ### 1. Basic Heap Operations (`01_heap_operations.py`)
 
-Demonstrates typed memory management with allocation, reading, and modification:
+Demonstrates typed-heap memory management with allocation, reading, and modification:
 
 - **Allocate**: Create typed objects in the kernel's heap
 - **Read**: Retrieve object data
 - **Write**: Modify objects using JSON Patch (RFC 6902)
-- **Delete**: Clean up allocated objects
+- **Delete**: Free allocated objects
 
 ```bash
 python3 examples/01_heap_operations.py
@@ -77,9 +77,9 @@ python3 examples/01_heap_operations.py
 Demonstrates capability-based authorization checks:
 
 - **Check authorization** for protected operations
-- **File I/O** with policy enforcement
-- **HTTP requests** with policy control
-- **Simulate denials** for testing
+- **File I/O** gated by policy
+- **Outbound requests** gated by policy
+- **Simulate denials** for testing the deny-by-default path
 
 ```bash
 python3 examples/02_authorization.py
@@ -87,9 +87,10 @@ python3 examples/02_authorization.py
 
 ### 3. WASM Tool Execution (`03_tool_execution.py`)
 
-Demonstrates sandboxed execution of WASM tools:
+Demonstrates sandboxed execution of WASM tools. Tool execution is integer-only
+(the WASM sandbox is built with `-mno-sse`):
 
-- **Execute WASM tools** in isolated sandbox
+- **Execute WASM tools** in an isolated sandbox
 - **Pass arguments** to tools via JSON
 - **Receive results** with capability-based access control
 - Built-in simulated tools: `add`, `concat`
@@ -98,12 +99,14 @@ Demonstrates sandboxed execution of WASM tools:
 python3 examples/03_tool_execution.py
 ```
 
-### 4. LLM Inference (`04_inference.py`)
+### 4. Outbound Requests (`04_inference.py`)
 
-Demonstrates policy-controlled LLM inference:
+Demonstrates a capability-gated outbound request. External effects are mediated
+by the kernel: the request is only issued if policy and the caller's capability
+permit it, and it is subject to the resource budget.
 
-- **Send inference requests** to configured LLM
-- **Policy enforcement** on model access
+- **Issue an outbound request** through the kernel
+- **Policy enforcement** on the request target
 - **Simulated responses** in simulation mode
 
 ```bash
@@ -112,11 +115,11 @@ python3 examples/04_inference.py
 
 ### 5. Audit Logging (`05_audit_logging.py`)
 
-Demonstrates tamper-proof audit logging:
+Demonstrates the tamper-evident audit log:
 
-- **Read audit logs** - Append-only, hash-chained entries
-- **Query logs** - Filter by event type, actor, timestamp
-- **Custom events** - Log application-specific events
+- **Read audit entries** - Append-only, hash-chained records
+- **Query the log** - Filter by event type, actor, timestamp
+- **Custom events** - Record application-specific events
 - Fully functional in simulation mode
 
 ```bash
@@ -125,16 +128,16 @@ python3 examples/05_audit_logging.py
 
 ## What Simulation Mode Does
 
-In simulation mode, the SDK uses an in-memory implementation that:
+In simulation mode, the SDK uses an in-memory implementation:
 
 | Feature | Simulation Behavior |
 |---------|---------------------|
 | Heap (alloc/read/write/delete) | Full implementation with versioning |
 | Authorization | Default allow-all, configurable denials |
 | Tool calls | Simulated `add` and `concat` tools |
-| Inference | Returns simulated responses |
-| Audit logs | In-memory, queryable log |
-| File I/O | Passes through to real filesystem |
+| Outbound requests | Returns simulated responses |
+| Audit log | In-memory, queryable log |
+| File I/O | Passes through to the real filesystem |
 
 ### Configuring Simulation Behavior
 
@@ -158,7 +161,7 @@ with AuthorityKernel(simulate=True) as ak:
 
 ### Using run_example.sh
 
-The helper script runs examples with proper setup:
+The helper script runs examples with the correct setup:
 
 ```bash
 # Run in simulation mode (default)
@@ -193,7 +196,7 @@ python3 examples/01_heap_operations.py --real  # For real kernel
 ```
 === Heap Operations Example (SIMULATION mode) ===
 
-[+] Connected to Authority Kernel
+[+] Connected to Authority kernel
 [+] Allocated counter with handle: Handle(id=1, version=0)
 [+] Read counter: {'value': 0, 'name': 'counter'}
 [+] Updated counter to version: 1
@@ -208,19 +211,19 @@ python3 examples/01_heap_operations.py --real  # For real kernel
 ```
 === Heap Operations Example (REAL KERNEL mode) ===
 
-[+] Connected to Authority Kernel
+[+] Connected to Authority kernel
 [+] Allocated counter with handle: Handle(id=0x7f2a8c0000, version=0)
 ...
 ```
 
 ## Error Handling
 
-Examples demonstrate proper error handling patterns:
+Examples demonstrate common error-handling patterns:
 
 - **AuthorityKernelError**: Base exception for kernel errors
 - **OperationDeniedError**: Policy denied the operation
 - **NotFoundError**: Resource not found
-- **InvalidArgumentError**: Bad argument to syscall
+- **InvalidArgumentError**: Bad argument to a syscall
 
 ## Troubleshooting
 
@@ -235,7 +238,7 @@ pip install -e sdk/python/
 
 ### "libak.so not found" (Real Kernel Mode Only)
 
-Build the kernel and set library path:
+Build the kernel and set the library path:
 ```bash
 make -j$(nproc)
 export LD_LIBRARY_PATH=output/platform/pc/lib:$LD_LIBRARY_PATH
@@ -243,7 +246,7 @@ export LD_LIBRARY_PATH=output/platform/pc/lib:$LD_LIBRARY_PATH
 
 ### "Operation denied" (Real Kernel Mode)
 
-Check policy configuration and capability grants.
+Check the policy configuration and capability grants.
 
 ## Documentation
 
@@ -255,4 +258,4 @@ For more details, see:
 
 ## License
 
-Examples are provided under the same license as Authority Nanos (Apache 2.0).
+Examples are provided under the same license as Authority (Apache 2.0).

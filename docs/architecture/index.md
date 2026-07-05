@@ -1,37 +1,35 @@
 # Architecture Overview
 
-Authority Nanos is a **fork of [Nanos](https://github.com/mbhatt1/nanos)** that adds the Authority Kernel — a capability-based security layer for AI agents.
+Authority is a **capability-based security unikernel** — a fork of [Nanos](https://github.com/mbhatt1/nanos) that adds the **Authority Kernel**, a deny-by-default enforcement layer. Each VM runs a **single untrusted program** and the Authority Kernel enforces kernel-level security on every effect it attempts.
 
 ## System Stack
 
 ```mermaid
 graph TB
     subgraph "User Space"
-        APP[AI Agent Application]
+        APP[Untrusted Program]
         LIB[Authority SDK / libc]
     end
 
     subgraph "Authority Kernel Layer"
-        GATE["ak_authorize_and_execute()"]
+        ENTRY["ak_syscall_handler()"]
+        DISPATCH["ak_dispatch()"]
 
-        subgraph "Security Pipeline"
+        subgraph "Dispatch Pipeline (fixed order)"
             direction LR
-            PARSE[Parse] --> SCHEMA[Schema]
-            SCHEMA --> SEQ[Sequence]
-            SEQ --> CAP[Capability]
-            CAP --> POLICY[Policy]
-            POLICY --> BUDGET[Budget]
-            BUDGET --> TAINT[Taint]
+            VAL[1 Validate] --> SEQ[2 Anti-Replay]
+            SEQ --> CAP[3 Capability]
+            CAP --> POLICY[4 Policy + Budget]
+            POLICY --> EXEC[5 Execute]
+            EXEC --> AUDIT[6 Audit]
         end
 
-        subgraph "Effect Handlers"
-            FS_EFF[FS Effects]
-            NET_EFF[Net Effects]
-            TOOL_EFF[Tool Effects]
-            INFER_EFF[Inference]
+        subgraph "Operation Handlers"
+            STATE_H[Heap / State]
+            TOOL_H[Tool - WASM]
+            IPC_H[IPC]
+            OUT_H[Outbound Request]
         end
-
-        AUDIT[Audit Logger]
     end
 
     subgraph "Nanos Kernel"
@@ -47,106 +45,85 @@ graph TB
     end
 
     APP --> LIB
-    LIB --> GATE
-    GATE --> PARSE
+    LIB --> ENTRY
+    ENTRY --> DISPATCH
+    DISPATCH --> VAL
 
-    TAINT --> FS_EFF
-    TAINT --> NET_EFF
-    TAINT --> TOOL_EFF
-    TAINT --> INFER_EFF
-
-    FS_EFF --> AUDIT
-    NET_EFF --> AUDIT
-    TOOL_EFF --> AUDIT
-    INFER_EFF --> AUDIT
+    EXEC --> STATE_H
+    EXEC --> TOOL_H
+    EXEC --> IPC_H
+    EXEC --> OUT_H
 
     AUDIT --> VFS
-    AUDIT --> NETSTACK
+    OUT_H --> NETSTACK
     VFS --> VIRTIO
     NETSTACK --> VIRTIO
     SCHED --> VIRTIO
     MEM --> VIRTIO
     VIRTIO --> KVM
 
-    style GATE fill:#e74c3c,color:#fff
+    style DISPATCH fill:#e74c3c,color:#fff
     style AUDIT fill:#2ecc71,color:#fff
 ```
 
-## Core Principle: Single Authority Gate
+## Core Principle: One Dispatch Path
 
-All authority-bearing operations MUST flow through ONE enforcement function:
+Every Authority syscall (numbers 1024+) is forwarded by the Nanos syscall layer to `ak_syscall_handler()`, which routes it through `ak_dispatch()`. The `ak_handle_*` operation handlers are never invoked directly — the dispatcher's pipeline runs first, every time.
 
 ```mermaid
 flowchart LR
-    subgraph "Entry Points"
-        POSIX[POSIX Syscalls]
-        AK_API[AK Syscalls]
-        TOOL[Tool Calls]
-        WASM[WASM Hostcalls]
+    subgraph "Entry"
+        AK_API["AK Syscalls (1024+)"]
     end
 
-    GATE[["ak_authorize_and_execute()"]]
+    HANDLER["ak_syscall_handler()"]
+    DISPATCH[["ak_dispatch()"]]
 
     subgraph "Outcomes"
         ALLOW[Execute & Log]
         DENY[Deny & Log]
     end
 
-    POSIX --> GATE
-    AK_API --> GATE
-    TOOL --> GATE
-    WASM --> GATE
+    AK_API --> HANDLER
+    HANDLER --> DISPATCH
 
-    GATE --> ALLOW
-    GATE --> DENY
+    DISPATCH --> ALLOW
+    DISPATCH --> DENY
 
-    style GATE fill:#e74c3c,color:#fff
+    style DISPATCH fill:#e74c3c,color:#fff
     style DENY fill:#c0392b,color:#fff
     style ALLOW fill:#27ae60,color:#fff
 ```
 
-- POSIX syscalls are a **compatibility frontend** that translate into AK effects
-- Default is **DENY-BY-DEFAULT**: if policy cannot prove allow, deny the effect
-- Agentic primitives (tools, WASM, inference) are first-class effects
+- Default is **deny-by-default**: if the pipeline cannot prove an allow, the effect is denied.
+- Tool execution, IPC, and outbound requests are ordinary handlers gated by the same pipeline.
+- A legacy `ak_effects.c` layer exists in the tree but is **not compiled** into the kernel; the compiled path is the dispatch pipeline described here.
 
-## Effect Model
+## Request Processing Pipeline
 
-Every effectful operation is expressed as an **AK Effect**:
+`ak_dispatch()` runs six stages in a fixed order; any failure short-circuits to audit and returns an error before the effect executes.
 
 ```mermaid
-classDiagram
-    class ak_effect_req {
-        +ak_effect_op_t op
-        +u64 trace_id
-        +pid_t pid
-        +tid_t tid
-        +char target[512]
-        +u8 params[4096]
-        +u32 params_len
-        +budget_t budget
-    }
+stateDiagram-v2
+    [*] --> Validate: Syscall arrives (1024+)
 
-    class ak_decision {
-        +boolean allow
-        +int reason_code
-        +int errno_equiv
-        +char missing_cap[64]
-        +char suggested_snippet[512]
-        +u64 trace_id
-    }
+    Validate --> Replay: pid/run_id/op OK
+    Replay --> Capability: Not a replay
+    Capability --> Policy: Capability subsumes request
+    Policy --> Execute: Policy allows + budget OK
+    Execute --> Audit: Effect performed
+    Audit --> Respond: Log entry durable (fsync)
+    Respond --> [*]: Response returned
 
-    class ak_effect_op {
-        <<enumeration>>
-        AK_E_FS_OPEN
-        AK_E_FS_UNLINK
-        AK_E_NET_CONNECT
-        AK_E_NET_DNS_RESOLVE
-        AK_E_TOOL_CALL
-        AK_E_INFER
-    }
+    Validate --> Reject: Bad pid/run_id/op
+    Replay --> Reject: Duplicate seq
+    Capability --> Reject: Missing/invalid/out-of-scope cap
+    Policy --> Reject: Policy deny or budget exceeded
+    Execute --> Reject: Execution error
 
-    ak_effect_req --> ak_effect_op
-    ak_effect_req ..> ak_decision : produces
+    Reject --> Audit: Log denial
+    note right of Capability: HMAC + scope + TTL + revocation
+    note right of Audit: Must be durable before respond
 ```
 
 ## Key Components
@@ -158,22 +135,22 @@ graph TB
     subgraph "Policy System"
         POLICY_FILE[Policy File<br/>JSON/TOML]
         POLICY_LOADER[Policy Loader]
-        POLICY_V2[ak_policy_v2_t]
+        POLICY_EVAL[ak_policy_evaluate]
         PATTERN[Pattern Matcher]
     end
 
     subgraph "Capability System"
         CAP_TOKEN[Capability Token]
         HMAC[HMAC-SHA256]
-        KEYRING[Keyring]
-        REVOKE[Revocation Map]
+        KEYRING[Per-Boot Signing Key]
+        REVOKE[Revocation Set]
     end
 
     subgraph "Audit System"
         LOG_ENTRY[Log Entry]
         HASH_CHAIN[Hash Chain]
-        RING_BUF[Ring Buffer]
-        ANCHOR[External Anchor]
+        SEGMENT[Segment Log]
+        FSYNC[Durable fsync]
     end
 
     subgraph "Budget System"
@@ -183,16 +160,16 @@ graph TB
     end
 
     POLICY_FILE --> POLICY_LOADER
-    POLICY_LOADER --> POLICY_V2
-    POLICY_V2 --> PATTERN
+    POLICY_LOADER --> POLICY_EVAL
+    POLICY_EVAL --> PATTERN
 
     CAP_TOKEN --> HMAC
     HMAC --> KEYRING
     CAP_TOKEN --> REVOKE
 
     LOG_ENTRY --> HASH_CHAIN
-    HASH_CHAIN --> RING_BUF
-    HASH_CHAIN --> ANCHOR
+    HASH_CHAIN --> SEGMENT
+    SEGMENT --> FSYNC
 
     BUDGET_DEF --> ADMIT
     USAGE --> ADMIT
@@ -204,19 +181,21 @@ graph TB
 
 ### Capability Token Structure
 
+Capabilities are HMAC-signed tokens. The signing key is generated per boot from the Nanos CSPRNG and never leaves the kernel.
+
 ```mermaid
 graph LR
     subgraph "Capability Token"
-        TYPE[Type<br/>Net/FS/Tool/Infer]
-        RESOURCE[Resource Pattern<br/>*.github.com]
+        TYPE[Type<br/>Net/FS/Tool/Secrets/...]
+        RESOURCE[Resource Pattern<br/>*.example.com]
         METHODS[Methods<br/>GET, POST]
-        TTL[TTL<br/>3600000ms]
-        RATE[Rate Limit<br/>100/min]
+        TTL[TTL]
+        RATE[Rate Limit]
         RUN_ID[Run ID]
         MAC[HMAC-SHA256<br/>32 bytes]
     end
 
-    KEY[Signing Key] --> MAC
+    KEY[Per-Boot Signing Key] --> MAC
     TYPE --> MAC
     RESOURCE --> MAC
     METHODS --> MAC
@@ -228,6 +207,8 @@ graph LR
 ```
 
 ### Audit Log Hash Chain
+
+Every dispatched request — allowed or denied — appends an entry, and the response is not returned until the entry is durable.
 
 ```mermaid
 graph LR
@@ -257,75 +238,16 @@ graph LR
     style THIS fill:#2ecc71,color:#fff
 ```
 
-## Request Processing Pipeline
+## Tool Execution and External I/O
 
-```mermaid
-stateDiagram-v2
-    [*] --> Receive: Request arrives
-
-    Receive --> Parse: Read frame
-    Parse --> Schema: JSON valid
-
-    Schema --> Sequence: Schema valid
-    Sequence --> Capability: Not replay
-
-    Capability --> Policy: Cap valid
-    Policy --> Budget: Policy allows
-
-    Budget --> Taint: Budget OK
-    Taint --> Execute: Taint OK
-
-    Execute --> Log: Operation done
-    Log --> Respond: fsync complete
-    Respond --> [*]: Response sent
-
-    Parse --> Reject: Invalid JSON
-    Schema --> Reject: Bad schema
-    Sequence --> Reject: Replay detected
-    Capability --> Reject: Invalid/expired cap
-    Policy --> Reject: Policy deny
-    Budget --> Reject: Exceeded
-    Taint --> Reject: Taint violation
-    Execute --> Reject: Execution error
-
-    Reject --> LogDeny: Log denial
-    LogDeny --> [*]: Error response
-
-    note right of Capability: HMAC verification
-    note right of Log: Must fsync before respond
-```
-
-## Modes of Operation
-
-```mermaid
-graph TB
-    subgraph "AK_MODE_OFF"
-        OFF_POSIX[POSIX Syscalls] --> OFF_KERN[Kernel]
-        OFF_NOTE[No AK enforcement<br/>Legacy mode]
-    end
-
-    subgraph "AK_MODE_SOFT"
-        SOFT_POSIX[POSIX Syscalls] --> SOFT_AK[Authority Kernel]
-        SOFT_AK --> SOFT_KERN[Kernel]
-        SOFT_NOTE[POSIX routed through AK<br/>Enforcement active]
-    end
-
-    subgraph "AK_MODE_HARD"
-        HARD_AK[AK Syscalls Only] --> HARD_KERN[Kernel]
-        HARD_POSIX[Raw POSIX] -->|DENIED| HARD_BLOCK[Blocked]
-        HARD_NOTE[Must use AK API<br/>Strictest mode]
-    end
-
-    style OFF_NOTE fill:#f39c12,color:#fff
-    style SOFT_NOTE fill:#3498db,color:#fff
-    style HARD_NOTE fill:#e74c3c,color:#fff
-```
+- **Tools** invoked via `AK_SYS_CALL` run in an **integer-only WASM subset interpreter** (`ak_wasm_interp.c`). The kernel is built `-mno-sse` with no floating point, so float value types and opcodes are rejected fail-closed. This is a bounded integer-only interpreter, not a full WASM runtime.
+- **Outbound network requests** use an async **issue/poll** model (`AK_SYS_INFER_ISSUE` / `AK_SYS_INFER_POLL`): the kernel enforces the pipeline on issue, the Nanos runloop drives the HTTP(S) request, and the program polls for the result. The kernel does not block a thread on external I/O.
 
 ## Platform Support
 
 ```mermaid
 graph TB
-    AUTH[Authority Nanos]
+    AUTH[Authority]
 
     subgraph "x86_64"
         X86_KVM[Linux + KVM]
@@ -358,30 +280,4 @@ graph TB
     ARM_KVM --> AWS
 
     style AUTH fill:#e74c3c,color:#fff
-```
-
-## Roadmap
-
-```mermaid
-gantt
-    title Authority Nanos Roadmap
-    dateFormat  YYYY-MM
-    section Core
-    Deny-by-default enforcement    :done, 2024-01, 2024-06
-    Security invariants INV-1-4    :done, 2024-03, 2024-06
-    POSIX syscall routing          :done, 2024-04, 2024-07
-
-    section Policy
-    JSON policy format             :done, 2024-05, 2024-08
-    TOML policy format             :active, 2024-09, 2025-01
-    Policy simulation tools        :2025-02, 2025-06
-
-    section Security
-    Audit logging                  :done, 2024-06, 2024-09
-    Budget enforcement             :done, 2024-07, 2024-10
-    WASM tool sandbox              :active, 2024-10, 2025-03
-
-    section Future
-    Distributed audit log          :2025-03, 2025-09
-    Formal verification            :2025-06, 2026-01
 ```

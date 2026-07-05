@@ -1,6 +1,6 @@
 # Security Overview
 
-Authority Nanos provides security-first design for AI agent runtimes. This section covers:
+Authority is a capability-based security unikernel built on Nanos. It runs a **single untrusted program** per VM and mediates every external effect that program can cause. This section covers:
 
 - [Security Invariants](/security/invariants) - The four foundational guarantees
 - [Threat Model](/security/threat-model) - What we protect against
@@ -26,7 +26,7 @@ graph TB
 
     subgraph "Layer 4: Audit System"
         HASH[Hash Chain]
-        FSYNC[fsync before respond]
+        FSYNC[Durable before respond]
     end
 
     subgraph "Layer 5: Resource Control"
@@ -34,7 +34,7 @@ graph TB
         RATE[Rate Limiting]
     end
 
-    AGENT[AI Agent] --> VM
+    PROGRAM[Untrusted Program] --> VM
     VM --> CAP
     CAP --> DENY
     DENY --> HASH
@@ -52,9 +52,9 @@ graph TB
 ```mermaid
 graph TB
     subgraph INV1["INV-1: No-Bypass"]
-        NB1[All I/O through kernel]
+        NB1[All effects through kernel syscalls]
         NB2[No direct hardware access]
-        NB3[Network namespace isolation]
+        NB3[Single address space, single program]
     end
 
     subgraph INV2["INV-2: Capability Required"]
@@ -71,7 +71,7 @@ graph TB
 
     subgraph INV4["INV-4: Audit Committed"]
         AUD1[Hash chain]
-        AUD2[fsync before respond]
+        AUD2[Durable before respond]
         AUD3[Tamper detection]
     end
 
@@ -137,7 +137,7 @@ graph LR
         T_CHECK -->|Error| T_ALLOW3[Allow Anyway]
     end
 
-    subgraph "Authority Nanos (Fail-Closed)"
+    subgraph "Authority (Fail-Closed)"
         A_REQ[Request] --> A_CHECK{Check}
         A_CHECK -->|Pass| A_ALLOW[Allow]
         A_CHECK -->|Fail| A_DENY[DENY]
@@ -192,14 +192,14 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Agent
-    participant Gate as Authority Gate
+    participant Program
+    participant Gate as Syscall Dispatch
     participant HMAC as HMAC Verifier
     participant Key as Keyring
     participant Rev as Revocation Map
     participant Scope as Scope Matcher
 
-    Agent->>Gate: Request + Capability
+    Program->>Gate: Request + Capability
     Gate->>HMAC: Verify MAC
 
     HMAC->>Key: Get signing key
@@ -209,14 +209,14 @@ sequenceDiagram
     HMAC->>HMAC: Constant-time compare
 
     alt MAC Invalid
-        HMAC-->>Agent: E_CAP_INVALID
+        HMAC-->>Program: E_CAP_INVALID
     end
 
     Gate->>Rev: Check revocation
     Rev->>Rev: Lookup token ID
 
     alt Token Revoked
-        Rev-->>Agent: E_CAP_REVOKED
+        Rev-->>Program: E_CAP_REVOKED
     end
 
     Gate->>Scope: Check scope
@@ -226,10 +226,10 @@ sequenceDiagram
     Scope->>Scope: Check rate limit
 
     alt Scope Mismatch
-        Scope-->>Agent: E_CAP_SCOPE
+        Scope-->>Program: E_CAP_SCOPE
     end
 
-    Gate-->>Agent: Capability Valid
+    Gate-->>Program: Capability Valid
 ```
 
 ## Audit Chain Verification
@@ -267,7 +267,7 @@ stateDiagram-v2
     [*] --> Detected: Invariant Violation
 
     Detected --> Halt: IMMEDIATE
-    Halt --> Revoke: Halt all agents
+    Halt --> Revoke: Halt the program
     Revoke --> Investigate: Revoke capabilities
 
     Investigate --> Forensics: Audit log analysis
@@ -283,7 +283,7 @@ stateDiagram-v2
 
     note right of Halt: P0: < 1 hour
     note right of Investigate: Preserve evidence
-    note right of Proof: Mathematical proof required
+    note right of Proof: Invariant argument required
 ```
 
 ## Security Testing Matrix
@@ -291,9 +291,9 @@ stateDiagram-v2
 ```mermaid
 graph TB
     subgraph "INV-1 Tests"
-        T1_1[Direct socket attempt]
-        T1_2[execve blocked]
-        T1_3[Network namespace escape]
+        T1_1[Effect without syscall attempt]
+        T1_2[Unknown/raw syscall blocked]
+        T1_3[Direct hardware access blocked]
     end
 
     subgraph "INV-2 Tests"
@@ -306,13 +306,13 @@ graph TB
     subgraph "INV-3 Tests"
         T3_1[Budget exhaustion]
         T3_2[Concurrent budget race]
-        T3_3[Negative budget]
+        T3_3[Overflow / wraparound]
     end
 
     subgraph "INV-4 Tests"
         T4_1[Log bit flip]
         T4_2[Entry deletion]
-        T4_3[Response before fsync]
+        T4_3[Response before durable log]
     end
 
     T1_1 --> PASS1[Must FAIL]
