@@ -30,7 +30,14 @@ ASDEPFLAGS=
 endif
 
 ifeq ($(UNAME_s),Darwin)
+# On macOS, Apple clang (cc) cross-compiles x86_64-elf and aarch64-elf via the
+# -target flag (added below only for clang). It has no riscv64 backend, so
+# riscv64 needs a real cross gcc; use $(CROSS_COMPILE)gcc for that target.
+ifeq ($(ARCH),riscv64)
+CC=		$(CROSS_COMPILE)gcc
+else
 CC=		cc
+endif
 else
 CC=		$(CROSS_COMPILE)gcc
 endif
