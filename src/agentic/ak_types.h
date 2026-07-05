@@ -66,6 +66,13 @@
 #define AK_SYS_BUDGET_HISTORY 1039   /* Get historical snapshots */
 #define AK_SYS_BUDGET_BREAKDOWN 1040 /* Get detailed breakdown */
 
+/* Category: ASYNC external I/O - enforced issue + non-blocking poll.
+ * INFER_ISSUE runs the full enforcement pipeline then issues an async HTTP(S)
+ * request to an LLM endpoint (returns a request id without blocking).
+ * INFER_POLL retrieves the result (self-scoped; returns -EAGAIN until ready). */
+#define AK_SYS_INFER_ISSUE 1041
+#define AK_SYS_INFER_POLL 1042
+
 #define AK_SYS_MIN 1024
 #define AK_SYS_MAX 1100
 
@@ -441,6 +448,10 @@ struct ak_agent_context {
   /* Capabilities */
   ak_capability_t *root_cap;
   table delegated_caps; /* tid -> ak_capability_t* */
+
+  /* Pending async external request (AK_SYS_INFER_ISSUE/POLL). One in flight
+   * per context; opaque ak_https handle, reaped by INFER_POLL. */
+  void *infer_handle;
 
   /* Policy (INV-2, INV-3 enforcement) */
   ak_policy_t *policy;

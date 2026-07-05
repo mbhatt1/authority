@@ -2170,6 +2170,96 @@ ak_response_t *ak_handle_inference(ak_agent_context_t *ctx, ak_request_t *req) {
 }
 
 /* ============================================================
+ * Async inference: enforced issue + non-blocking poll.
+ *
+ * INFER_ISSUE runs inside ak_dispatch (so capability/policy/budget/audit have
+ * already been enforced synchronously), then issues an async HTTP(S) POST to an
+ * LLM endpoint and returns immediately with a request id. INFER_POLL reaps the
+ * result (returns -EAGAIN until the runloop has driven the request to
+ * completion). This is the model that actually works in Nanos: the syscall does
+ * not block, so the runloop drives the network while the agent polls with a
+ * yielding wait. Args: {model, prompt, host, port, tls, path}.
+ * ============================================================ */
+ak_response_t *ak_handle_infer_issue(ak_agent_context_t *ctx,
+                                     ak_request_t *req) {
+  heap h = ak_inf_state.h ? ak_inf_state.h : (ctx ? ctx->heap : 0);
+  if (!ctx || !req || !h)
+    return 0;
+  if (!ak_transport_available())
+    return ak_response_error(h, req, AK_E_LLM_NOT_CONFIGURED);
+  if (ctx->infer_handle)
+    return ak_response_error(h, req, AK_E_LLM_API_ERROR); /* one in flight */
+  if (!req->args)
+    return ak_response_error(h, req, AK_E_SCHEMA_INVALID);
+
+  char host[128] = {0}, path[128] = {0}, model[64] = {0}, prompt[512] = {0};
+  u64 port = 0, tls = 0;
+  json_extract_string(req->args, "host", host, sizeof(host));
+  json_extract_string(req->args, "path", path, sizeof(path));
+  json_extract_string(req->args, "model", model, sizeof(model));
+  json_extract_string(req->args, "prompt", prompt, sizeof(prompt));
+  json_extract_int(req->args, "port", &port);
+  json_extract_int(req->args, "tls", &tls);
+  if (host[0] == 0)
+    return ak_response_error(h, req, AK_E_SCHEMA_INVALID);
+  if (path[0] == 0) {
+    path[0] = '/';
+    path[1] = 0;
+  }
+
+  /* Minimal JSON body {"model":"..","prompt":".."} (demo: no escaping). */
+  buffer body = allocate_buffer(h, 64 + runtime_strlen(model) +
+                                       runtime_strlen(prompt));
+  if (body == INVALID_ADDRESS)
+    return ak_response_error(h, req, AK_E_TOOL_FAIL);
+  buffer_write(body, "{\"model\":\"", 10);
+  buffer_write(body, model, runtime_strlen(model));
+  buffer_write(body, "\",\"prompt\":\"", 12);
+  buffer_write(body, prompt, runtime_strlen(prompt));
+  buffer_write(body, "\"}", 2);
+
+  ak_http_header hdr = {"Content-Type", "application/json"};
+  void *hnd = ak_https_issue(host, port ? (u16)port : (tls ? 443 : 80),
+                             tls ? true : false, AK_HTTP_METHOD_POST, path, &hdr,
+                             1, buffer_ref(body, 0), buffer_length(body));
+  deallocate_buffer(body); /* ak_https copies the body */
+  if (!hnd)
+    return ak_response_error(h, req, AK_E_LLM_CONNECTION_FAILED);
+
+  ctx->infer_handle = hnd;
+  buffer result = allocate_buffer(h, 12);
+  buffer_write(result, "{\"id\":1}", 8);
+  return ak_response_success(h, req, result);
+}
+
+ak_response_t *ak_handle_infer_poll(ak_agent_context_t *ctx,
+                                    ak_request_t *req) {
+  heap h = ak_inf_state.h ? ak_inf_state.h : (ctx ? ctx->heap : 0);
+  if (!ctx || !req || !h)
+    return 0;
+  if (!ctx->infer_handle)
+    return ak_response_error(h, req, AK_E_SCHEMA_INVALID);
+
+  buffer resp = 0;
+  s64 st = ak_https_poll(ctx->infer_handle, &resp);
+  if (st == -EAGAIN)
+    return ak_response_error(h, req, -EAGAIN); /* still pending */
+
+  ctx->infer_handle = 0; /* reaped */
+  if (st < 0) {
+    if (resp)
+      deallocate_buffer(resp);
+    return ak_response_error(h, req, st);
+  }
+  /* Return the endpoint's response body (the LLM answer) as the result. */
+  if (!resp) {
+    resp = allocate_buffer(h, 2);
+    buffer_write(resp, "{}", 2);
+  }
+  return ak_response_success(h, req, resp);
+}
+
+/* ============================================================
  * STATISTICS
  * ============================================================ */
 

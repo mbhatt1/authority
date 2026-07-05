@@ -228,7 +228,7 @@ int tls_set_cacert(void *cert, u64 len)
     return ret;
 }
 
-int tls_connect(ip_addr_t *addr, u16 port, sstring hostname, connection_handler ch)
+int tls_connect(ip_addr_t *addr, u16 port, connection_handler ch)
 {
     tls_conn conn = allocate(tls.h, sizeof(*conn));
     if (conn == INVALID_ADDRESS)
@@ -238,22 +238,6 @@ int tls_connect(ip_addr_t *addr, u16 port, sstring hostname, connection_handler 
     if (ret) {
         msg_err("%s: cannot set up SSL context", func_ss);
         goto err_ssl_setup;
-    }
-    /* Set SNI (and the expected cert name). Many servers - including CDN-fronted
-     * hosts like example.com - reject a ClientHello without SNI. Copy the
-     * hostname to a null-terminated buffer for mbedtls, which dups it. Skip when
-     * no hostname is given (e.g. a raw IP target). */
-    if (hostname.len > 0) {
-        char hostbuf[256];
-        u64 hlen = hostname.len < sizeof(hostbuf) - 1 ? hostname.len
-                                                      : sizeof(hostbuf) - 1;
-        runtime_memcpy(hostbuf, hostname.ptr, hlen);
-        hostbuf[hlen] = '\0';
-        if (mbedtls_ssl_set_hostname(&conn->ssl, hostbuf)) {
-            msg_err("%s: cannot set TLS hostname", func_ss);
-            ret = -1;
-            goto err_connect;
-        }
     }
     conn->app_ch = ch;
     conn->app_in = 0;

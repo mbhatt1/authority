@@ -482,6 +482,12 @@ ak_response_t *ak_dispatch(ak_agent_context_t *ctx, ak_request_t *req) {
   case AK_SYS_INFERENCE:
     res = ak_handle_inference(ctx, req);
     break;
+  case AK_SYS_INFER_ISSUE:
+    res = ak_handle_infer_issue(ctx, req);
+    break;
+  case AK_SYS_INFER_POLL:
+    res = ak_handle_infer_poll(ctx, req);
+    break;
   case AK_SYS_BUDGET_STATUS:
     res = ak_handle_budget_status(ctx, req);
     break;
@@ -557,7 +563,7 @@ s64 ak_validate_request(ak_agent_context_t *ctx, ak_request_t *req) {
 
   /* Check op is valid (includes budget introspection ops, which
    * ak_dispatch handles) */
-  if (req->op < AK_SYS_READ || req->op > AK_SYS_BUDGET_BREAKDOWN)
+  if (req->op < AK_SYS_READ || req->op > AK_SYS_INFER_POLL)
     return -EINVAL;
 
   return 0;
@@ -579,7 +585,7 @@ s64 ak_validate_capability(ak_agent_context_t *ctx, ak_request_t *req) {
    * construction, no external effect, so no capability is required.
    */
   if (req->op == AK_SYS_BUDGET_STATUS || req->op == AK_SYS_BUDGET_HISTORY ||
-      req->op == AK_SYS_BUDGET_BREAKDOWN)
+      req->op == AK_SYS_BUDGET_BREAKDOWN || req->op == AK_SYS_INFER_POLL)
     return 0;
 
   /* Determine required capability type and the REAL target resource */
@@ -622,6 +628,8 @@ s64 ak_validate_capability(ak_agent_context_t *ctx, ak_request_t *req) {
     method = "invoke";
     break;
   case AK_SYS_INFERENCE:
+  case AK_SYS_INFER_ISSUE:
+    /* External LLM I/O requires an LLM capability scoped to the model. */
     required_type = AK_CAP_LLM;
     if (ak_json_extract_string(req->args, "model", resource_buf,
                                sizeof(resource_buf)) <= 0)
@@ -2387,7 +2395,7 @@ sysreturn ak_syscall_handler(u64 call, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
    * Bypasses the AK pipeline; used only for runtime TLS verification.
    */
   /* Validate syscall range (includes budget introspection ops) */
-  if (call < AK_SYS_BASE || call > AK_SYS_BUDGET_BREAKDOWN)
+  if (call < AK_SYS_BASE || call > AK_SYS_INFER_POLL)
     return -ENOSYS;
 
   ak_agent_context_t *current_ctx = NULL;

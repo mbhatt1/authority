@@ -274,6 +274,10 @@ void ak_inference_response_free(heap h, ak_inference_response_t *res);
  * }
  */
 ak_response_t *ak_handle_inference(ak_agent_context_t *ctx, ak_request_t *req);
+/* Async external LLM I/O (see ak_inference.c). INFER_ISSUE issues a non-blocking
+ * HTTP(S) POST to an LLM endpoint; INFER_POLL reaps it (-EAGAIN until ready). */
+ak_response_t *ak_handle_infer_issue(ak_agent_context_t *ctx, ak_request_t *req);
+ak_response_t *ak_handle_infer_poll(ak_agent_context_t *ctx, ak_request_t *req);
 
 /* ============================================================
  * LOCAL INFERENCE (virtio-serial)

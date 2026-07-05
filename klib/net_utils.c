@@ -35,7 +35,7 @@ static status net_http_req_internal(const ip_addr_t *addr, net_http_req_data dat
     if (!params->tls) {
         s = direct_connect(data->h, (ip_addr_t *)addr, port, ch);
     } else {
-        if (tls_connect((ip_addr_t *)addr, port, params->host, ch) == 0)
+        if (tls_connect((ip_addr_t *)addr, port, ch) == 0)
             s =  STATUS_OK;
         else
             s = timm("result", "failed to establish TLS connection with HTTP server");

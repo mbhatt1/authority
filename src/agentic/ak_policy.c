@@ -1216,6 +1216,7 @@ s64 ak_policy_evaluate(ak_policy_t *policy, ak_budget_tracker_t *budget,
 
     switch (req->op) {
     case AK_SYS_INFERENCE:
+    case AK_SYS_INFER_ISSUE:
       resource_type = AK_RESOURCE_TOKENS;
       estimated_cost = 1000; /* Estimate */
       break;
