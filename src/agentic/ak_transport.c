@@ -195,21 +195,22 @@ s64 ak_https_request(const char *host, u16 port, boolean tls,
 
   /* Wait for the async completion against a real-time deadline.
    *
-   * The completion (net_http_req -> tls/tcp) is driven by deferred work on the
-   * runloop's queues, which are NOT serviced while this syscall context waits.
-   * process_bhqueue() cooperatively pumps those queues (bottom-half, deferred
-   * status handlers where virtqueue completions land, cpu-local, memory) so the
-   * DNS/TCP/TLS/HTTP chain advances - without it the completion never fires and
-   * every request times out. The deadline is wall-clock based so it is
-   * insensitive to per-iteration cost. */
+   * ARCHITECTURAL LIMITATION (do not "fix" with a busy-loop pump): the
+   * completion (net_http_req -> tls/tcp) is driven by deferred work on the
+   * runloop's queues, which are NOT serviced while this syscall context is
+   * spinning here. Nanos processes the network stack from the runloop, and a
+   * syscall context cannot correctly drive it cooperatively (verified: even a
+   * guest->host TCP connect times out while DHCP - driven by the real runloop -
+   * succeeds). Making external I/O actually complete requires converting this
+   * into an ASYNC syscall (blockq_check + a completion that formats the result
+   * and wakes the thread) so the syscall yields to the runloop and resumes on
+   * completion. Until then this request is issued but times out. The deadline
+   * is wall-clock based so the timeout is predictable. */
   u32 ms = timeout_ms ? timeout_ms : AK_HTTPS_MIN_TIMEOUT_MS;
   timestamp deadline = now(CLOCK_ID_MONOTONIC) + milliseconds(ms);
   boolean timed_out = false;
   while (!latch->done) {
-    process_bhqueue();
     memory_barrier();
-    if (latch->done)
-      break;
     kern_pause();
     if (now(CLOCK_ID_MONOTONIC) >= deadline) {
       timed_out = true;
