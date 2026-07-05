@@ -37,17 +37,75 @@ typedef struct ak_key {
 #define AK_KEY_ROTATION_MS (24 * 60 * 60 * 1000) /* 24 hours */
 #define AK_KEY_GRACE_MS (4 * AK_KEY_ROTATION_MS)
 
-/* Initialize key management subsystem */
+/* Initialize key management subsystem.
+ *
+ * If a seed was staged with ak_keys_set_seed() before this call, the
+ * initial signing key is derived deterministically from that seed
+ * (allowing capabilities issued in a previous boot to verify).
+ * Otherwise a fresh random key is generated (fail-safe default). */
 void ak_keys_init(heap h);
 
 /* Get current active key for signing */
 ak_key_t *ak_key_get_active(void);
 
-/* Get key by ID for verification */
+/* Get key by ID for verification (never returns retired keys) */
 ak_key_t *ak_key_get(u8 kid);
 
 /* Rotate keys (called periodically) */
 void ak_key_rotate(void);
+
+/* ============================================================
+ * KEY PERSISTENCE
+ * ============================================================
+ * PERSISTENCE CONTRACT:
+ *
+ * Without persistence, every boot generates a fresh random signing
+ * key and all previously-issued capabilities fail verification.
+ * A caller that wants capabilities to survive a restart must either:
+ *
+ *   (a) call ak_keys_set_seed(seed, len) BEFORE ak_keys_init() with a
+ *       stable secret seed (>= 16 bytes recommended); the initial key
+ *       is derived deterministically from the seed, so the same seed
+ *       reproduces the same key set at boot; or
+ *
+ *   (b) after boot, call ak_keys_export() and persist the returned
+ *       blob to protected storage; on the next boot, call
+ *       ak_keys_init() then ak_keys_import(blob) to restore the full
+ *       key set (all grace keys + rotation counter).
+ *
+ * SECURITY: The exported blob contains RAW HMAC KEY MATERIAL.
+ * The caller MUST store it in integrity- and confidentiality-
+ * protected storage and zero its copies after use. Import rebases
+ * key lifetimes onto the current (monotonic) clock: the active key
+ * gets a full rotation+grace lifetime, restored grace keys get a
+ * grace-period lifetime.
+ */
+
+/* Exported key-set blob framing */
+#define AK_KEYS_BLOB_MAGIC 0x534B4B41u /* "AKKS" (little-endian) */
+#define AK_KEYS_BLOB_VERSION 1
+#define AK_KEYS_BLOB_SIZE (16 + AK_MAX_KEYS * 56)
+
+/*
+ * Stage a seed for deterministic key derivation in ak_keys_init().
+ * Must be called before ak_keys_init(); the staged copy is zeroed
+ * once consumed. Passing NULL or len == 0 clears a staged seed.
+ */
+void ak_keys_set_seed(const u8 *seed, u32 len);
+
+/*
+ * Export the current key set (all slots, active index, rotation
+ * counter) as an opaque blob of AK_KEYS_BLOB_SIZE bytes.
+ * Returns NULL on allocation failure.
+ */
+buffer ak_keys_export(heap h);
+
+/*
+ * Restore a key set previously produced by ak_keys_export().
+ * Must be called after ak_keys_init(). Fail-closed: returns false
+ * (leaving the existing key set untouched) on any malformed input.
+ */
+boolean ak_keys_import(buffer blob);
 
 /* ============================================================
  * CAPABILITY CREATION
@@ -120,7 +178,8 @@ void ak_capability_destroy(heap h, ak_capability_t *cap);
  *   0               - Valid
  *   AK_E_CAP_MISSING - cap is NULL
  *   AK_E_CAP_INVALID - MAC verification failed (forged/corrupted)
- *   AK_E_CAP_EXPIRED - TTL exceeded or key retired
+ *                      or signing key unknown/retired
+ *   AK_E_CAP_EXPIRED - TTL exceeded
  *
  * SECURITY: Uses constant-time comparison to prevent timing attacks.
  * INV-2: This is the first step in capability validation.
@@ -164,6 +223,10 @@ typedef struct ak_revocation_entry {
   u8 tid[AK_TOKEN_ID_SIZE];
   u64 revoked_ms;
   buffer reason;
+  /* Hash-chain link: the revocation table is keyed by a 64-bit hash
+   * of the full 16-byte tid; entries whose tids collide on that hash
+   * are chained here and disambiguated by full-tid comparison. */
+  struct ak_revocation_entry *next;
 } ak_revocation_entry_t;
 
 /* Initialize revocation subsystem */
@@ -223,13 +286,52 @@ void ak_rate_limit_reset(u8 *tid);
 buffer ak_capability_canonicalize(heap h, ak_capability_t *cap);
 
 /*
+ * Capability wire format v1 (host byte order; tokens never leave the
+ * machine that minted them - the HMAC key is local):
+ *
+ *   off  size  field
+ *   0    4     magic = AK_CAP_WIRE_MAGIC
+ *   4    1     version = AK_CAP_WIRE_VERSION
+ *   5    1     kid
+ *   6    1     type (ak_cap_type_t)
+ *   7    1     method_count (0..8)
+ *   8    2     total_len (u16, whole message incl. header)
+ *   10   2     resource_len (u16, < 256)
+ *   12   8     issued_ms
+ *   20   4     ttl_ms
+ *   24   4     rate_limit
+ *   28   4     rate_window_ms
+ *   32   16    run_id
+ *   48   16    tid
+ *   64   32    mac
+ *   96   var   resource bytes (resource_len, no NUL)
+ *        var   method_count x { u8 len (< 32); len bytes }
+ *
+ *   total_len == 96 + resource_len + sum(1 + len_i)
+ *
+ * Trailing bytes past total_len (e.g. padding in a fixed-size
+ * transport buffer) are ignored by the parser.
+ */
+#define AK_CAP_WIRE_MAGIC 0x31504143u /* "CAP1" (little-endian) */
+#define AK_CAP_WIRE_VERSION 1
+#define AK_CAP_WIRE_HDR_SIZE 96
+/* Upper bound on a serialized capability: header + max resource (255) +
+ * up to 8 methods of (1 length byte + 31 chars). Used to bound the read
+ * of a per-call token from the syscall ABI. */
+#define AK_CAP_WIRE_MAX_SIZE (AK_CAP_WIRE_HDR_SIZE + 255 + 8 * 32)
+
+/*
  * Serialize capability to wire format (includes MAC).
+ * Returns NULL on allocation failure.
  */
 buffer ak_capability_serialize(heap h, ak_capability_t *cap);
 
 /*
- * Parse capability from wire format.
- * Does NOT verify - caller must call ak_capability_verify().
+ * Parse capability from wire format (exact inverse of
+ * ak_capability_serialize). Fail-closed: returns NULL on any
+ * malformation (short buffer, bad magic/version/lengths).
+ * Does NOT verify - caller must call ak_capability_verify();
+ * the mac bytes are preserved for that purpose.
  */
 ak_capability_t *ak_capability_parse(heap h, buffer data);
 

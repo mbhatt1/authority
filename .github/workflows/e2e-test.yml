@@ -213,6 +213,13 @@ jobs:
     name: E2E macOS x86_64
     runs-on: macos-15-intel
     timeout-minutes: 45
+    # KNOWN ESCAPE: this job currently FAILS: the x86_64 kernel does
+    # not compile because src/agentic/ak_budget.c's dead function
+    # ak_budget_calc_rate() returns 'double', incompatible with the
+    # kernel's -mno-sse flags (see KNOWN ISSUE in platform/pc/Makefile).
+    # The same failure affects any PLATFORM=pc build. Once fixed in
+    # source and this job is observed green, remove continue-on-error
+    # so regressions fail CI instead of being masked.
     continue-on-error: true
     steps:
       - name: Checkout code

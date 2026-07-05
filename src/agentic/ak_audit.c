@@ -63,7 +63,15 @@ typedef struct ak_audit_entry_header {
   u32 reserved; /* Alignment padding */
 } __attribute__((packed)) ak_audit_entry_header_t;
 
-/* File header at start of audit log */
+/*
+ * File header at start of audit log.
+ *
+ * Written once at offset 0 when the file is first created (before the
+ * first entry). entry_count/last_seq/last_hash/file_size record the
+ * creation-time snapshot and are ADVISORY only: the authoritative log
+ * state is reconstructed by scanning and verifying the hash-chained
+ * entries that follow the header (see ak_audit_load).
+ */
 typedef struct ak_audit_file_header {
   u32 magic;                  /* AK_AUDIT_MAGIC */
   u32 version;                /* AK_AUDIT_VERSION */
@@ -77,9 +85,9 @@ typedef struct ak_audit_file_header {
 
 typedef struct ak_log_segment {
   ak_log_entry_t entries[AK_LOG_SEGMENT_SIZE];
-  u32 count;
+  u32 count;   /* Entries present in this segment */
+  u32 flushed; /* Entries [0, flushed) are already durable on disk */
   u64 start_seq;
-  boolean dirty;
 } ak_log_segment_t;
 
 static struct {
@@ -105,10 +113,15 @@ static struct {
 #else
   void *audit_file; /* Placeholder when storage disabled */
 #endif
-  u64 file_offset;               /* Current write offset in file */
-  boolean storage_enabled;       /* Whether persistent storage is active */
-  volatile boolean sync_pending; /* Sync operation in progress */
-  volatile s64 sync_result;      /* Result of last sync operation */
+  u64 file_offset;         /* Next write offset in file */
+  boolean storage_enabled; /* Whether persistent storage is active */
+  word sync_outstanding;   /* Outstanding async write/flush operations
+                            * (incremented on issue, decremented on
+                            * completion; batch is durable at zero) */
+  volatile s64 sync_result;      /* Combined result of current sync batch;
+                                  * any failed completion latches an error */
+  volatile boolean read_pending; /* Recovery read in progress */
+  volatile s64 read_result;      /* Result of last recovery read */
 
   boolean initialized;
 } ak_log;
@@ -120,8 +133,13 @@ static struct {
 
 /* Forward declarations for storage helpers */
 #ifdef KERNEL_STORAGE_ENABLED
-static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry);
+static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry, u64 offset);
+static s64 ak_audit_read_from_disk(void *dst, u64 offset, u64 len);
 static u32 ak_audit_crc32(const u8 *data, u64 len);
+
+/* Serialized on-disk size of one entry */
+#define AK_AUDIT_ENTRY_DISK_SIZE                                               \
+  (sizeof(ak_audit_entry_header_t) + sizeof(ak_log_entry_t))
 #endif
 
 /* ============================================================
@@ -160,8 +178,10 @@ void ak_audit_init(heap h) {
   ak_log.audit_file = NULL;
   ak_log.file_offset = 0;
   ak_log.storage_enabled = false;
-  ak_log.sync_pending = false;
+  ak_log.sync_outstanding = 0;
   ak_log.sync_result = 0;
+  ak_log.read_pending = false;
+  ak_log.read_result = 0;
 
   /*
    * Open or create the audit log file.
@@ -199,6 +219,14 @@ s64 ak_audit_open_storage(void) {
 
   /* Get current file length for append position */
   ak_log.file_offset = fsfile_get_length(ak_log.audit_file);
+  if (ak_log.file_offset < sizeof(ak_audit_file_header_t)) {
+    /*
+     * Too small to hold a valid file header - treat as a fresh log.
+     * The header (and entries) will be rewritten from offset 0 on the
+     * first sync batch.
+     */
+    ak_log.file_offset = 0;
+  }
   ak_log.storage_enabled = true;
 
   ak_debug("ak_audit: opened audit log, size=%llu", ak_log.file_offset);
@@ -257,64 +285,50 @@ s64 ak_audit_load(void) {
   runtime_memcpy(prev_hash, AK_GENESIS_HASH, AK_HASH_SIZE);
   runtime_memcpy(last_valid_hash, AK_GENESIS_HASH, AK_HASH_SIZE);
 
-  /* Step 1: Read and verify file header if present */
-  if (file_size >= sizeof(ak_audit_file_header_t)) {
-    ak_audit_file_header_t file_header;
-    runtime_memset((u8 *)&file_header, 0, sizeof(file_header));
+  /*
+   * Step 1: Read and verify the file header.
+   * ak_audit_open_storage() already reset file_offset to 0 for files
+   * too small to hold a header, so file_size covers at least one here.
+   */
+  ak_audit_file_header_t file_header;
+  runtime_memset((u8 *)&file_header, 0, sizeof(file_header));
 
-    sg_list sg = allocate_sg_list();
-    if (!sg || sg == INVALID_ADDRESS) {
-      ak_error("ak_audit: failed to allocate sg_list for header read");
-      return AK_E_LOG_CORRUPT;
-    }
-
-    sg_buf sgb = sg_list_tail_add(sg, sizeof(file_header));
-    if (sgb == INVALID_ADDRESS) {
-      deallocate_sg_list(sg);
-      ak_error("ak_audit: failed to allocate sg_buf for header read");
-      return AK_E_LOG_CORRUPT;
-    }
-    sgb->buf = &file_header;
-    sgb->size = sizeof(file_header);
-    sgb->offset = 0;
-    sgb->refcount = 0;
-
-    /* Read file header synchronously */
-    range r = irangel(0, sizeof(file_header));
-    sg_io reader = fsfile_get_reader(ak_log.audit_file);
-    apply(reader, sg, r, ignore_status);
-
-    deallocate_sg_list(sg);
-
-    /* Verify file header magic and version */
-    if (file_header.magic != AK_AUDIT_MAGIC) {
-      ak_warn("ak_audit: invalid file magic 0x%08x, expected 0x%08x",
-              file_header.magic, AK_AUDIT_MAGIC);
-      /* File doesn't have our header format - could be raw entries, start fresh
-       */
-      ak_debug("ak_audit: starting fresh due to incompatible format");
-      return 0;
-    }
-
-    if (file_header.version != AK_AUDIT_VERSION) {
-      ak_warn("ak_audit: unsupported version %u, expected %u",
-              file_header.version, AK_AUDIT_VERSION);
-      return AK_E_LOG_CORRUPT;
-    }
-
-    /* Verify header CRC32 (CRC is computed over header excluding the crc32
-     * field itself) */
-    /* Offset calculation: magic(4) + version(4) + entry_count(8) + last_seq(8) + last_hash(32) + file_size(8) = 64 */
-    u32 header_crc = ak_audit_crc32((const u8 *)&file_header, 64);
-    if (header_crc != file_header.crc32) {
-      ak_warn("ak_audit: file header CRC mismatch");
-      return AK_E_LOG_CORRUPT;
-    }
-
-    offset = sizeof(ak_audit_file_header_t);
-    ak_debug("ak_audit: file header valid, entry_count=%llu, last_seq=%llu",
-             file_header.entry_count, file_header.last_seq);
+  s64 rv = ak_audit_read_from_disk(&file_header, 0, sizeof(file_header));
+  if (rv < 0) {
+    ak_error("ak_audit: failed to read file header, error=%lld", rv);
+    return AK_E_LOG_CORRUPT;
   }
+
+  /* Verify file header magic and version */
+  if (file_header.magic != AK_AUDIT_MAGIC) {
+    ak_warn("ak_audit: invalid file magic 0x%08x, expected 0x%08x",
+            file_header.magic, AK_AUDIT_MAGIC);
+    /*
+     * File doesn't have our header format - incompatible. Start fresh
+     * and rewrite from offset 0 so the new log carries a valid header.
+     */
+    ak_debug("ak_audit: starting fresh due to incompatible format");
+    ak_log.file_offset = 0;
+    return 0;
+  }
+
+  if (file_header.version != AK_AUDIT_VERSION) {
+    ak_warn("ak_audit: unsupported version %u, expected %u",
+            file_header.version, AK_AUDIT_VERSION);
+    return AK_E_LOG_CORRUPT;
+  }
+
+  /* Verify header CRC32 (CRC is computed over header excluding the crc32
+   * field itself) */
+  /* Offset calculation: magic(4) + version(4) + entry_count(8) + last_seq(8) + last_hash(32) + file_size(8) = 64 */
+  u32 header_crc = ak_audit_crc32((const u8 *)&file_header, 64);
+  if (header_crc != file_header.crc32) {
+    ak_warn("ak_audit: file header CRC mismatch");
+    return AK_E_LOG_CORRUPT;
+  }
+
+  offset = sizeof(ak_audit_file_header_t);
+  ak_debug("ak_audit: file header valid (version %u)", file_header.version);
 
   /* Step 2 & 3: Iterate through entries, verify CRC32 and rebuild hash chain */
   spin_lock(&ak_log.lock);
@@ -324,36 +338,19 @@ s64 ak_audit_load(void) {
   if (ak_log.segment_count > 0 && ak_log.segments[0]) {
     ak_log.segments[0]->start_seq = 1;
     ak_log.segments[0]->count = 0;
+    ak_log.segments[0]->flushed = 0;
   }
 
   while (offset + sizeof(ak_audit_entry_header_t) <= file_size) {
-    /* Read entry header from disk */
+    /* Read entry header from disk, waiting for I/O completion */
     ak_audit_entry_header_t entry_header;
     runtime_memset((u8 *)&entry_header, 0, sizeof(entry_header));
-    {
-      sg_list sg = allocate_sg_list();
-      if (!sg || sg == INVALID_ADDRESS) {
-        ak_error("ak_audit: failed to allocate sg_list for entry header read");
-        spin_unlock(&ak_log.lock);
-        return AK_E_LOG_CORRUPT;
-      }
-
-      sg_buf sgb = sg_list_tail_add(sg, sizeof(entry_header));
-      if (sgb == INVALID_ADDRESS) {
-        deallocate_sg_list(sg);
-        ak_error("ak_audit: failed to allocate sg_buf for entry header read");
-        spin_unlock(&ak_log.lock);
-        return AK_E_LOG_CORRUPT;
-      }
-      sgb->buf = &entry_header;
-      sgb->size = sizeof(entry_header);
-      sgb->offset = 0;
-      sgb->refcount = 0;
-
-      range r = irangel(offset, sizeof(entry_header));
-      sg_io reader = fsfile_get_reader(ak_log.audit_file);
-      apply(reader, sg, r, ignore_status);
-      deallocate_sg_list(sg);
+    rv = ak_audit_read_from_disk(&entry_header, offset, sizeof(entry_header));
+    if (rv < 0) {
+      ak_warn("ak_audit: entry header read failed at offset %llu, "
+              "stopping recovery",
+              offset);
+      break;
     }
 
     /* Verify entry header magic */
@@ -391,34 +388,14 @@ s64 ak_audit_load(void) {
       return AK_E_LOG_CORRUPT;
     }
 
-    /* Read entry data from disk */
-    {
-      sg_list sg = allocate_sg_list();
-      if (!sg || sg == INVALID_ADDRESS) {
-        deallocate(ak_log.h, entry, sizeof(ak_log_entry_t));
-        ak_error("ak_audit: failed to allocate sg_list for entry read");
-        spin_unlock(&ak_log.lock);
-        return AK_E_LOG_CORRUPT;
-      }
-
-      sg_buf sgb = sg_list_tail_add(sg, sizeof(ak_log_entry_t));
-      if (sgb == INVALID_ADDRESS) {
-        deallocate_sg_list(sg);
-        deallocate(ak_log.h, entry, sizeof(ak_log_entry_t));
-        ak_error("ak_audit: failed to allocate sg_buf for entry read");
-        spin_unlock(&ak_log.lock);
-        return AK_E_LOG_CORRUPT;
-      }
-      sgb->buf = entry;
-      sgb->size = sizeof(ak_log_entry_t);
-      sgb->offset = 0;
-      sgb->refcount = 0;
-
-      range r = irangel(offset + sizeof(ak_audit_entry_header_t),
-                        sizeof(ak_log_entry_t));
-      sg_io reader = fsfile_get_reader(ak_log.audit_file);
-      apply(reader, sg, r, ignore_status);
-      deallocate_sg_list(sg);
+    /* Read entry data from disk, waiting for I/O completion */
+    rv = ak_audit_read_from_disk(entry, offset + sizeof(ak_audit_entry_header_t),
+                                 sizeof(ak_log_entry_t));
+    if (rv < 0) {
+      ak_warn("ak_audit: entry read failed at offset %llu, stopping recovery",
+              offset);
+      deallocate(ak_log.h, entry, sizeof(ak_log_entry_t));
+      break;
     }
 
     /* Verify CRC32 of entry data */
@@ -471,7 +448,7 @@ s64 ak_audit_load(void) {
     /* Copy entry to segment */
     runtime_memcpy(&seg->entries[seg->count], entry, sizeof(ak_log_entry_t));
     seg->count++;
-    seg->dirty = false; /* Entry is already on disk */
+    seg->flushed = seg->count; /* Entry is already durable on disk */
 
     /* Update chain state for next iteration */
     runtime_memcpy(prev_hash, entry->this_hash, AK_HASH_SIZE);
@@ -671,8 +648,12 @@ s64 ak_audit_append(u8 *pid, u8 *run_id, u16 op, u8 *req_hash, u8 *res_hash,
   ak_log.head_seq = entry->seq;
   runtime_memcpy(ak_log.head_hash, entry->this_hash, AK_HASH_SIZE);
 
+  /*
+   * seg->count advances past seg->flushed, marking this entry as
+   * not-yet-durable; ak_audit_sync() below writes exactly the
+   * [flushed, count) range and advances the watermark.
+   */
   seg->count++;
-  seg->dirty = true;
 
   u64 seq = entry->seq;
 
@@ -921,7 +902,11 @@ s64 ak_audit_emit_anchor(void) {
   /* Policy hash from current active policy (if available) */
   runtime_memset(anchor->policy_hash, 0, AK_HASH_SIZE);
 
-  /* Anchor signature requires cryptographic key management */
+  /*
+   * UNSIGNED: no signing key is provisioned in this subsystem, so the
+   * signature is zeroed. See the ANCHORING section in ak_audit.h for
+   * what unsigned anchors do and do not provide.
+   */
   runtime_memset(anchor->signature, 0, 64);
 
   ak_log.anchor_count++;
@@ -973,9 +958,10 @@ boolean ak_audit_verify_anchor(ak_anchor_t *anchor) {
 
 void ak_audit_post_anchor_remote(ak_anchor_t *anchor, const char *url) {
   /*
-   * Posts anchor to external transparency log via HTTP.
-   * Requires network stack integration.
-   * Failures are logged but do not block operation (best effort).
+   * STUB - NOT IMPLEMENTED: remote anchor posting requires network
+   * stack integration that is not wired up here. Nothing is
+   * transmitted; callers must not assume any external commitment
+   * was made. Anchors remain in-memory only (lost on reboot).
    */
   (void)anchor;
   (void)url;
@@ -1036,78 +1022,114 @@ static buffer ak_audit_serialize_entry(ak_log_entry_t *entry) {
 }
 
 /*
- * Completion handler for async file sync operation.
+ * Completion handler for the batch fsync operation.
  * Called when fsfile_flush completes.
  */
-closure_func_basic(status_handler, void, ak_audit_sync_handler, status s) {
-  if (is_ok(s)) {
-    ak_log.sync_result = 0;
-  } else {
+closure_func_basic(status_handler, void, ak_audit_flush_complete, status s) {
+  if (!is_ok(s)) {
     ak_error("ak_audit: fsync failed");
     ak_log.sync_result = -EIO;
   }
-  ak_log.sync_pending = false;
+  fetch_and_add(&ak_log.sync_outstanding, -1);
   closure_finish();
 }
 
 /*
- * Completion handler for async file write operation.
- * After write completes, triggers fsync.
+ * Completion handler for async file write operations.
+ *
+ * Multiple writes may be outstanding in one sync batch; each completion
+ * merges its result into sync_result (any failure latches an error) and
+ * decrements the outstanding counter. ak_audit_sync() waits for the
+ * counter to reach zero, so it cannot return after only the first
+ * completion while later writes are still in flight.
  */
-closure_function(2, 1, void, ak_audit_write_complete, buffer, b, u64, write_len,
-                 status s) {
-  buffer b = bound(b);
-  u64 write_len = bound(write_len);
-
-  if (is_ok(s)) {
-    /* Update file offset on successful write */
-    ak_log.file_offset += write_len;
-
-    /* Now sync to ensure durability - INV-4 CRITICAL */
-    status_handler sh =
-        closure_func(ak_log.h, status_handler, ak_audit_sync_handler);
-    if (sh && sh != INVALID_ADDRESS) {
-      fsfile_flush(ak_log.audit_file, false, sh);
-    } else {
-      ak_error("ak_audit: failed to allocate sync handler");
-      ak_log.sync_result = -ENOMEM;
-      ak_log.sync_pending = false;
-    }
-  } else {
+closure_function(1, 1, void, ak_audit_write_complete, buffer, b, status s) {
+  if (!is_ok(s)) {
     ak_error("ak_audit: write failed");
     ak_log.sync_result = -EIO;
-    ak_log.sync_pending = false;
   }
 
   /* Free the write buffer */
+  buffer b = bound(b);
   if (b)
     deallocate_buffer(b);
 
+  /* Decrement last: waiter must observe sync_result before zero */
+  fetch_and_add(&ak_log.sync_outstanding, -1);
   closure_finish();
 }
 
 /*
- * Write a single entry to disk.
- * Returns 0 on success, negative on error.
- *
- * INV-4 CRITICAL: This function initiates an async write.
- * Caller must wait for sync to complete before proceeding.
+ * Completion handler for synchronous-style recovery reads.
  */
-static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry) {
-  if (!ak_log.storage_enabled || !ak_log.audit_file)
-    return 0; /* Storage not enabled, skip silently */
+closure_func_basic(status_handler, void, ak_audit_read_complete, status s) {
+  ak_log.read_result = is_ok(s) ? 0 : -EIO;
+  ak_log.read_pending = false;
+  closure_finish();
+}
 
-  /* Serialize entry */
-  buffer entry_buf = ak_audit_serialize_entry(entry);
-  if (!entry_buf)
+/*
+ * Read len bytes at offset into dst, waiting for I/O completion before
+ * returning. Used by ak_audit_load(); recovery must never parse a
+ * buffer whose read has not completed.
+ *
+ * Returns 0 on success, negative on error.
+ */
+static s64 ak_audit_read_from_disk(void *dst, u64 offset, u64 len) {
+  sg_list sg = allocate_sg_list();
+  if (!sg || sg == INVALID_ADDRESS)
     return -ENOMEM;
 
-  u64 write_len = buffer_length(entry_buf);
+  sg_buf sgb = sg_list_tail_add(sg, len);
+  if (sgb == INVALID_ADDRESS) {
+    deallocate_sg_list(sg);
+    return -ENOMEM;
+  }
+  sgb->buf = dst;
+  sgb->size = len;
+  sgb->offset = 0;
+  sgb->refcount = 0;
+
+  status_handler sh =
+      closure_func(ak_log.h, status_handler, ak_audit_read_complete);
+  if (!sh || sh == INVALID_ADDRESS) {
+    deallocate_sg_list(sg);
+    return -ENOMEM;
+  }
+
+  ak_log.read_result = 0;
+  ak_log.read_pending = true;
+
+  range r = irangel(offset, len);
+  sg_io reader = fsfile_get_reader(ak_log.audit_file);
+  apply(reader, sg, r, sh);
+
+  /* Wait for read completion before the caller parses dst */
+  while (ak_log.read_pending) {
+    memory_barrier();
+    kern_pause();
+  }
+
+  deallocate_sg_list(sg);
+  return ak_log.read_result;
+}
+
+/*
+ * Issue an async write of buffer b at the given file offset.
+ *
+ * Takes ownership of b: it is freed by the completion handler after the
+ * write completes, or here on setup failure.
+ *
+ * On success, sync_outstanding has been incremented; the caller must
+ * drain it via ak_audit_wait_io() before inspecting sync_result.
+ */
+static s64 ak_audit_write_buffer_to_disk(buffer b, u64 offset) {
+  u64 write_len = buffer_length(b);
 
   /* Create scatter-gather list for write */
   sg_list sg = allocate_sg_list();
   if (!sg || sg == INVALID_ADDRESS) {
-    deallocate_buffer(entry_buf);
+    deallocate_buffer(b);
     return -ENOMEM;
   }
 
@@ -1115,44 +1137,112 @@ static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry) {
   sg_buf sgb = sg_list_tail_add(sg, write_len);
   if (sgb == INVALID_ADDRESS) {
     deallocate_sg_list(sg);
-    deallocate_buffer(entry_buf);
+    deallocate_buffer(b);
     return -ENOMEM;
   }
-  sgb->buf = buffer_ref(entry_buf, 0);
+  sgb->buf = buffer_ref(b, 0);
   sgb->size = write_len;
   sgb->offset = 0;
   sgb->refcount = 0;
 
-  /* Mark sync as pending */
-  ak_log.sync_pending = true;
-  ak_log.sync_result = 0;
-
   /* Create completion handler */
-  status_handler write_sh =
-      closure(ak_log.h, ak_audit_write_complete, entry_buf, write_len);
+  status_handler write_sh = closure(ak_log.h, ak_audit_write_complete, b);
   if (!write_sh || write_sh == INVALID_ADDRESS) {
     deallocate_sg_list(sg);
-    deallocate_buffer(entry_buf);
-    ak_log.sync_pending = false;
+    deallocate_buffer(b);
     return -ENOMEM;
   }
 
-  /* Write to file at current offset */
-  range r = irangel(ak_log.file_offset, write_len);
+  /* Account for this write before issuing; completion decrements */
+  fetch_and_add(&ak_log.sync_outstanding, 1);
+
+  range r = irangel(offset, write_len);
   sg_io writer = fsfile_get_writer(ak_log.audit_file);
   apply(writer, sg, r, write_sh);
 
-  /* Release sg_list after write initiation (buffer released in completion) */
+  /* Release sg_list after write initiation (buffer freed in completion) */
   deallocate_sg_list(sg);
 
   return 0;
 }
 
 /*
- * Synchronize dirty entries to disk and wait for fsync completion.
+ * Write a single entry to disk at the given file offset.
+ * Called with ak_log.lock held, from ak_audit_sync().
+ *
+ * Returns 0 on success (async write issued and accounted for in
+ * sync_outstanding), negative on error.
+ */
+static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry, u64 offset) {
+  buffer entry_buf = ak_audit_serialize_entry(entry);
+  if (!entry_buf)
+    return -ENOMEM;
+
+  return ak_audit_write_buffer_to_disk(entry_buf, offset);
+}
+
+/*
+ * Write the file header at offset 0 of a freshly created log file.
+ * Called with ak_log.lock held, on the first sync batch of a new file.
+ *
+ * The counters recorded here are the creation-time snapshot (see
+ * ak_audit_file_header_t); recovery re-derives log state by scanning
+ * the entries.
+ */
+static s64 ak_audit_write_file_header(void) {
+  ak_audit_file_header_t hdr;
+  runtime_memset((u8 *)&hdr, 0, sizeof(hdr));
+  hdr.magic = AK_AUDIT_MAGIC;
+  hdr.version = AK_AUDIT_VERSION;
+  hdr.entry_count = 0;
+  hdr.last_seq = 0;
+  runtime_memcpy(hdr.last_hash, AK_GENESIS_HASH, AK_HASH_SIZE);
+  hdr.file_size = sizeof(ak_audit_file_header_t);
+  /* CRC over the 64 bytes of header fields preceding crc32 */
+  hdr.crc32 = ak_audit_crc32((const u8 *)&hdr, 64);
+  hdr.reserved = 0;
+
+  buffer b = allocate_buffer(ak_log.h, sizeof(hdr));
+  if (!b || b == INVALID_ADDRESS)
+    return -ENOMEM;
+  buffer_write(b, &hdr, sizeof(hdr));
+
+  return ak_audit_write_buffer_to_disk(b, 0);
+}
+
+/*
+ * Wait for all outstanding async I/O in the current sync batch.
+ *
+ * INV-4 CRITICAL: waits for the outstanding-operation COUNTER to reach
+ * zero, not for a single completion - the batch is only durable once
+ * every issued write (and the trailing fsync) has completed.
+ *
+ * DESIGN DECISION: Spin-wait with memory barriers.
+ * This is intentional for the audit sync path: async waiting would
+ * allow the caller to proceed before durability is guaranteed,
+ * violating INV-4. The spin-wait blocks until I/O completion, with
+ * kern_pause() yielding CPU time.
+ */
+static void ak_audit_wait_io(void) {
+  while (ak_log.sync_outstanding != 0) {
+    /* Memory barrier to ensure we see completion-side updates */
+    memory_barrier();
+    /* Yield CPU briefly to allow I/O completion */
+    kern_pause();
+  }
+}
+
+/*
+ * Synchronize unflushed entries to disk and wait for fsync completion.
+ *
+ * Each entry is written exactly once, in seq order, at a unique file
+ * offset: segments track a flushed watermark and only entries in
+ * [flushed, count) are issued. The watermark (and file_offset) advance
+ * only after the whole batch - all writes plus one fsync - succeeds,
+ * so a failed batch is retried at the same offsets on the next sync.
  *
  * INV-4 ENFORCEMENT: This function MUST NOT return until all
- * dirty entries are durably stored on disk (fsync completed).
+ * unflushed entries are durably stored on disk (fsync completed).
  *
  * The caller (typically ak_audit_append) blocks on this to ensure
  * no response is sent before the log entry is committed.
@@ -1160,61 +1250,98 @@ static s64 ak_audit_write_entry_to_disk(ak_log_entry_t *entry) {
 void ak_audit_sync(void) {
   spin_lock(&ak_log.lock);
 
-  /* If storage is not enabled, just mark clean and return */
+  /* If storage is not enabled, entries remain in-memory only */
   if (!ak_log.storage_enabled) {
     for (u32 i = 0; i < ak_log.segment_count; i++) {
       ak_log_segment_t *seg = ak_log.segments[i];
-      if (seg->dirty) {
-        seg->dirty = false;
-      }
+      seg->flushed = seg->count;
     }
     spin_unlock(&ak_log.lock);
     return;
   }
 
-  /* Write all dirty entries to disk */
-  for (u32 i = 0; i < ak_log.segment_count; i++) {
-    ak_log_segment_t *seg = ak_log.segments[i];
-    if (seg->dirty) {
-      /* Write each entry in the dirty segment */
-      for (u32 j = 0; j < seg->count; j++) {
-        ak_log_entry_t *entry = &seg->entries[j];
-        s64 rv = ak_audit_write_entry_to_disk(entry);
-        if (rv < 0) {
-          ak_error("ak_audit: failed to write entry seq=%llu, error=%lld",
-                   entry->seq, rv);
-          /* Continue trying to write other entries */
-        }
-      }
+  u64 batch_start_offset = ak_log.file_offset;
+  boolean issued = false;
+  ak_log.sync_result = 0;
 
-      /*
-       * INV-4 CRITICAL: Wait for sync to complete before marking clean.
-       * We spin-wait here because this is a critical path and we MUST
-       * guarantee durability before returning.
-       *
-       * DESIGN DECISION: Spin-wait with memory barriers.
-       * This is intentional for the audit sync path: async waiting
-       * would allow the caller to proceed before durability is
-       * guaranteed, violating INV-4. The spin-wait ensures we block
-       * until I/O completion, with kern_pause() yielding CPU time.
-       */
-      while (ak_log.sync_pending) {
-        /* Memory barrier to ensure we see updates to sync_pending */
-        memory_barrier();
-        /* Yield CPU briefly to allow I/O completion */
-        kern_pause();
-      }
+  /*
+   * Fresh file (nothing durable yet): write the file header at offset 0
+   * before the first entry, but only if there is something to flush.
+   */
+  if (ak_log.file_offset == 0) {
+    boolean have_unflushed = false;
+    for (u32 i = 0; i < ak_log.segment_count && !have_unflushed; i++)
+      have_unflushed = ak_log.segments[i]->flushed < ak_log.segments[i]->count;
 
-      /* Check sync result */
-      if (ak_log.sync_result < 0) {
-        ak_error("ak_audit: sync failed for segment %u, error=%lld", i,
-                 ak_log.sync_result);
-        /* Do NOT mark as clean if sync failed - will retry on next sync */
+    if (have_unflushed) {
+      s64 rv = ak_audit_write_file_header();
+      if (rv < 0) {
+        ak_error("ak_audit: failed to write file header, error=%lld", rv);
+        ak_log.sync_result = rv;
       } else {
-        /* Only mark as clean AFTER successful sync - INV-4 enforcement */
-        seg->dirty = false;
+        ak_log.file_offset = sizeof(ak_audit_file_header_t);
+        issued = true;
       }
     }
+  }
+
+  /* Issue writes for new (not-yet-flushed) entries only */
+  if (ak_log.sync_result == 0) {
+    for (u32 i = 0; i < ak_log.segment_count; i++) {
+      ak_log_segment_t *seg = ak_log.segments[i];
+      for (u32 j = seg->flushed; j < seg->count; j++) {
+        s64 rv = ak_audit_write_entry_to_disk(&seg->entries[j],
+                                              ak_log.file_offset);
+        if (rv < 0) {
+          ak_error("ak_audit: failed to write entry seq=%llu, error=%lld",
+                   seg->entries[j].seq, rv);
+          ak_log.sync_result = rv;
+          break;
+        }
+        ak_log.file_offset += AK_AUDIT_ENTRY_DISK_SIZE;
+        issued = true;
+      }
+      if (ak_log.sync_result < 0)
+        break;
+    }
+  }
+
+  if (!issued) {
+    /* Nothing was written (already durable, or setup failed early) */
+    spin_unlock(&ak_log.lock);
+    return;
+  }
+
+  /* Wait for ALL outstanding writes to complete */
+  ak_audit_wait_io();
+
+  /* All writes landed: one fsync covers the whole batch - INV-4 CRITICAL */
+  if (ak_log.sync_result == 0) {
+    status_handler sh =
+        closure_func(ak_log.h, status_handler, ak_audit_flush_complete);
+    if (sh && sh != INVALID_ADDRESS) {
+      fetch_and_add(&ak_log.sync_outstanding, 1);
+      fsfile_flush(ak_log.audit_file, false, sh);
+      ak_audit_wait_io();
+    } else {
+      ak_error("ak_audit: failed to allocate flush handler");
+      ak_log.sync_result = -ENOMEM;
+    }
+  }
+
+  if (ak_log.sync_result < 0) {
+    /*
+     * Batch failed: roll back file_offset so the same entries are
+     * rewritten at the same offsets on the next sync. Watermarks are
+     * left unchanged, so nothing is lost or duplicated.
+     */
+    ak_error("ak_audit: sync failed, error=%lld; will retry",
+             ak_log.sync_result);
+    ak_log.file_offset = batch_start_offset;
+  } else {
+    /* Advance watermarks only AFTER successful fsync - INV-4 enforcement */
+    for (u32 i = 0; i < ak_log.segment_count; i++)
+      ak_log.segments[i]->flushed = ak_log.segments[i]->count;
   }
 
   spin_unlock(&ak_log.lock);
@@ -1223,7 +1350,7 @@ void ak_audit_sync(void) {
 #else /* !KERNEL_STORAGE_ENABLED */
 
 /*
- * When storage is disabled: just mark entries as clean (in-memory only).
+ * When storage is disabled: just advance watermarks (in-memory only).
  * INV-4 is enforced for in-memory entries but not persisted across reboots.
  */
 void ak_audit_sync(void) {
@@ -1231,9 +1358,7 @@ void ak_audit_sync(void) {
 
   for (u32 i = 0; i < ak_log.segment_count; i++) {
     ak_log_segment_t *seg = ak_log.segments[i];
-    if (seg->dirty) {
-      seg->dirty = false;
-    }
+    seg->flushed = seg->count;
   }
 
   spin_unlock(&ak_log.lock);

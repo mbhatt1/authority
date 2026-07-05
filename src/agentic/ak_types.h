@@ -39,22 +39,24 @@
 #define AK_SYS_WRITE 1026  /* Patch object with CAS */
 #define AK_SYS_DELETE 1027 /* Soft-delete object */
 
-/* Category: TOOLS - External effect execution */
-#define AK_SYS_CALL 1028  /* Execute tool */
+/* Category: TOOLS - External effect execution.
+ * NOTE: numbers must match the SDK ABI (src/agentic/libak.h, README).
+ * CALL is 1031 and QUERY is 1028 - do not renumber to be file-sequential. */
+#define AK_SYS_CALL 1031  /* Execute tool */
 #define AK_SYS_BATCH 1029 /* Atomic batch of operations */
 
 /* Category: AUDIT - Log operations */
 #define AK_SYS_COMMIT 1030 /* Force log sync */
-#define AK_SYS_QUERY 1031  /* Query audit log */
+#define AK_SYS_QUERY 1028  /* Query audit log */
 
 /* Category: CONTROL - Agent lifecycle and IPC */
 #define AK_SYS_SPAWN 1032  /* Create child agent */
 #define AK_SYS_SEND 1033   /* Send typed message */
 #define AK_SYS_RECV 1034   /* Receive message */
-#define AK_SYS_ASSERT 1035 /* Assert predicate (halt on fail) */
+#define AK_SYS_ASSERT 1036 /* Assert predicate (halt on fail); ABI=1036 */
 
 /* Category: OUTPUT - External response */
-#define AK_SYS_RESPOND 1036 /* Send response (DLP applied) */
+#define AK_SYS_RESPOND 1035 /* Send response (DLP applied); ABI=1035 */
 
 /* Category: COGNITIVE - LLM gateway */
 #define AK_SYS_INFERENCE 1037 /* LLM inference request */

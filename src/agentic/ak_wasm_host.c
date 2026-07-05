@@ -17,6 +17,7 @@
 #include "ak_compat.h"
 #include "ak_heap.h"
 #include "ak_secrets.h"
+#include "ak_transport.h"
 #include "ak_virtio_proxy.h"
 #include "ak_wasm.h"
 
@@ -265,56 +266,142 @@ __attribute__((unused)) static buffer create_json_error(heap h,
 }
 
 /* ============================================================
+ * DIRECT IN-KERNEL HTTPS HELPERS
+ * ============================================================
+ *
+ * Used when a transport klib (klib/ak_https.c) has registered the
+ * in-kernel HTTPS transport. When it has not, the network host functions
+ * keep routing through the virtio proxy (or fail closed).
+ */
+
+/*
+ * Parse an "http(s)://host[:port]/path" URL into components.
+ *
+ * Returns 0 on success, negative AK_E_* on malformed input. `host` and
+ * `path` are NUL-terminated on success; `path` defaults to "/".
+ */
+static s64 ak_http_parse_url(const char *url, char *host, u64 host_sz,
+                             u16 *port, boolean *tls, char *path,
+                             u64 path_sz) {
+  const char *p = url;
+  if (runtime_memcmp(p, "https://", 8) == 0) {
+    *tls = true;
+    *port = 443;
+    p += 8;
+  } else if (runtime_memcmp(p, "http://", 7) == 0) {
+    *tls = false;
+    *port = 80;
+    p += 7;
+  } else {
+    return AK_E_NET_URL_INVALID;
+  }
+
+  /* Host runs until ':' (port), '/' (path), or end. */
+  u64 hi = 0;
+  while (*p && *p != ':' && *p != '/') {
+    if (hi + 1 >= host_sz)
+      return AK_E_NET_HOST_INVALID;
+    host[hi++] = *p++;
+  }
+  if (hi == 0)
+    return AK_E_NET_HOST_INVALID;
+  host[hi] = 0;
+
+  /* Optional port. */
+  if (*p == ':') {
+    p++;
+    u32 pn = 0;
+    boolean any = false;
+    while (*p >= '0' && *p <= '9') {
+      pn = pn * 10 + (u32)(*p - '0');
+      if (pn > 65535)
+        return AK_E_NET_HOST_INVALID;
+      any = true;
+      p++;
+    }
+    if (!any)
+      return AK_E_NET_HOST_INVALID;
+    *port = (u16)pn;
+  }
+
+  /* Path (everything from '/' onward), default "/". */
+  if (*p != '/') {
+    if (path_sz < 2)
+      return AK_E_NET_URL_INVALID;
+    path[0] = '/';
+    path[1] = 0;
+  } else {
+    u64 pi = 0;
+    while (*p) {
+      if (pi + 1 >= path_sz)
+        return AK_E_NET_URL_INVALID;
+      path[pi++] = *p++;
+    }
+    path[pi] = 0;
+  }
+  return 0;
+}
+
+/*
+ * Build the {"status": <code>, "body": "<escaped>"} result buffer that
+ * WASM callers expect. Returns 0 (INVALID_ADDRESS) on OOM.
+ */
+static buffer ak_http_build_result(heap h, s64 status, buffer body) {
+  buffer res =
+      allocate_buffer(h, 256 + (body ? buffer_length(body) : 0));
+  if (res == INVALID_ADDRESS)
+    return res;
+
+  buffer_write(res, "{\"status\": ", 11);
+
+  char status_buf[16];
+  int status_len = 0;
+  s64 s = status;
+  if (s <= 0) {
+    status_buf[status_len++] = '0';
+  } else {
+    char temp[16];
+    int temp_len = 0;
+    while (s > 0) {
+      temp[temp_len++] = '0' + (int)(s % 10);
+      s /= 10;
+    }
+    for (int i = temp_len - 1; i >= 0; i--)
+      status_buf[status_len++] = temp[i];
+  }
+  buffer_write(res, status_buf, status_len);
+
+  buffer_write(res, ", \"body\": \"", 11);
+  if (body && buffer_length(body) > 0)
+    json_escape_to_buffer(res, buffer_ref(body, 0), buffer_length(body));
+  buffer_write(res, "\"}", 2);
+  return res;
+}
+
+/* ============================================================
  * NETWORK HOST FUNCTIONS (AK_CAP_NET)
  * ============================================================ */
 
 /*
  * ak_host_http_get - HTTP GET request from WASM sandbox
  *
- * NOT IMPLEMENTED - Returns AK_E_NOT_IMPLEMENTED
+ * PROXIED VIA VIRTIO-SERIAL: the Nanos unikernel has no in-kernel HTTP
+ * client (DNS, TCP, TLS and HTTP protocol handling all live host-side),
+ * so the request is delegated to the akproxy daemon on the host through
+ * ak_proxy_http_get().
  *
- * WHY NOT IMPLEMENTED:
- *   The Nanos unikernel does not include an HTTP client library suitable for
- *   synchronous kernel-space calls. HTTP requests require:
- *     - DNS resolution (async, may require multiple network round-trips)
- *     - TCP connection establishment (3-way handshake)
- *     - TLS handshake for HTTPS (computationally expensive, cert validation)
- *     - HTTP protocol handling (chunked encoding, redirects, etc.)
+ * Behavior:
+ *   - Proxy connected:     the host performs the real HTTP GET and the
+ *                          actual status code and body are returned.
+ *   - Proxy NOT connected: FAIL CLOSED with AK_E_NOT_IMPLEMENTED.
+ *                          No response is ever fabricated.
  *
- *   These operations are inherently asynchronous and can take seconds to
- *   complete. Blocking the WASM executor for this duration would:
- *     - Stall other agents waiting for execution slots
- *     - Risk timeout violations in the capability system
- *     - Create unpredictable latency in tool execution
- *
- * ALTERNATIVES FOR AGENTS:
- *   1. VIRTIO-SERIAL PROXY (Recommended):
- *      Use ak_host_ipc_send() to request HTTP fetches from the host hypervisor.
- *      The host-side orchestrator can perform the HTTP request asynchronously
- *      and deliver results back via virtio-serial.
- *
- *      Example flow:
- *        WASM tool -> ak_host_ipc_send({"type":"http_get","url":"..."})
- *        Host receives request, performs HTTP GET
- *        Host -> ak_host_ipc_recv() delivers response to WASM tool
- *
- *   2. PRE-FETCH PATTERN:
- *      The orchestrator pre-fetches required data before invoking the tool,
- *      passing the content as part of the tool's input arguments.
- *
- *   3. STREAMING RESPONSE:
- *      For large responses, use ak_host_stream_* to receive data incrementally
- *      from the host-side proxy.
- *
- * FUTURE IMPLEMENTATION:
- *   This function may be implemented when Nanos adds support for:
- *     - Asynchronous HTTP client library (e.g., libcurl port)
- *     - Cooperative yield points allowing WASM to suspend during I/O
- *     - HTTP connection pooling for capability-scoped connections
- *   Track progress: https://github.com/nanovms/nanos/issues (HTTP client)
+ * SECURITY: The URL is validated against the AK_CAP_NET capability
+ * before any proxy traffic is generated.
  *
  * Args: {"url": "https://example.com/api/data"}
- * Returns: AK_E_NOT_IMPLEMENTED (always)
+ * Returns: 0 with {"status": <code>, "body": "<escaped body>"},
+ *          or a negative error (AK_E_NOT_IMPLEMENTED if proxy is down)
  */
 s64 ak_host_http_get(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   /* Initialize *result to NULL to ensure defined state on error paths */
@@ -338,6 +425,37 @@ s64 ak_host_http_get(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   s64 cap_result = validate_host_cap(ctx, AK_CAP_NET, url_buf, "GET");
   if (cap_result != 0)
     return cap_result;
+
+  /*
+   * Preferred path: direct in-kernel HTTPS when a transport klib is
+   * registered. Falls through to the virtio proxy path when it is not.
+   */
+  if (ak_transport_available()) {
+    char host[256];
+    char path[512];
+    u16 port;
+    boolean tls;
+    s64 pr = ak_http_parse_url(url_buf, host, sizeof(host), &port, &tls, path,
+                               sizeof(path));
+    if (pr != 0)
+      return pr;
+
+    buffer resp = 0;
+    s64 st = ak_https_request(host, port, tls, AK_HTTP_METHOD_GET, path, 0, 0,
+                              0, 0, &resp, 30000);
+    if (st < 0) {
+      if (resp)
+        deallocate_buffer(resp);
+      return st;
+    }
+    buffer res = ak_http_build_result(ctx->agent->heap, st, resp);
+    if (resp)
+      deallocate_buffer(resp);
+    if (res == INVALID_ADDRESS)
+      return AK_E_WASM_OOM;
+    *result = res;
+    return 0;
+  }
 
   /* Check if virtio proxy is connected */
   if (!ak_proxy_connected())
@@ -396,34 +514,24 @@ s64 ak_host_http_get(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
 /*
  * ak_host_http_post - HTTP POST request from WASM sandbox
  *
- * NOT IMPLEMENTED - Returns AK_E_NOT_IMPLEMENTED
+ * PROXIED VIA VIRTIO-SERIAL: same architecture as ak_host_http_get() -
+ * there is no in-kernel HTTP client, so the request (including the
+ * optional body) is delegated to the akproxy daemon on the host through
+ * ak_proxy_http_post().
  *
- * WHY NOT IMPLEMENTED:
- *   Same rationale as ak_host_http_get(). HTTP POST has additional complexity:
- *     - Request body serialization and content-type handling
- *     - Potential for large request payloads requiring memory management
- *     - Response body parsing (JSON, form-urlencoded, etc.)
+ * Behavior:
+ *   - Proxy connected:     the host performs the real HTTP POST and the
+ *                          actual status code and body are returned.
+ *   - Proxy NOT connected: FAIL CLOSED with AK_E_NOT_IMPLEMENTED.
+ *                          No response is ever fabricated.
  *
- * ALTERNATIVES FOR AGENTS:
- *   See ak_host_http_get() documentation for the recommended patterns:
- *     1. VIRTIO-SERIAL PROXY - Use ak_host_ipc_send() with request body
- *     2. PRE-FETCH PATTERN - Orchestrator handles HTTP interactions
- *     3. STREAMING - Use ak_host_stream_* for incremental data transfer
- *
- *   For POST specifically, the IPC message should include the body:
- *     ak_host_ipc_send({
- *       "type": "http_post",
- *       "url": "https://api.example.com/data",
- *       "body": {"key": "value"},
- *       "content_type": "application/json"
- *     })
- *
- * FUTURE IMPLEMENTATION:
- *   Will be implemented alongside ak_host_http_get() when Nanos adds
- *   asynchronous HTTP client support. Same prerequisites apply.
+ * SECURITY: The URL is validated against the AK_CAP_NET capability
+ * before any proxy traffic is generated.
  *
  * Args: {"url": "https://...", "body": "...", "content_type":
- * "application/json"} Returns: AK_E_NOT_IMPLEMENTED (always)
+ * "application/json"}
+ * Returns: 0 with {"status": <code>, "body": "<body>"},
+ *          or a negative error (AK_E_NOT_IMPLEMENTED if proxy is down)
  */
 s64 ak_host_http_post(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   /* Initialize *result to NULL to ensure defined state on error paths */
@@ -446,6 +554,55 @@ s64 ak_host_http_post(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   s64 cap_result = validate_host_cap(ctx, AK_CAP_NET, url_buf, "POST");
   if (cap_result != 0)
     return cap_result;
+
+  /*
+   * Preferred path: direct in-kernel HTTPS when a transport klib is
+   * registered. Falls through to the virtio proxy path when it is not.
+   */
+  if (ak_transport_available()) {
+    char host[256];
+    char path[512];
+    u16 port;
+    boolean tls;
+    s64 pr = ak_http_parse_url(url_buf, host, sizeof(host), &port, &tls, path,
+                               sizeof(path));
+    if (pr != 0)
+      return pr;
+
+    u64 d_body_len = 0;
+    const char *d_body = parse_json_string(args, "body", &d_body_len);
+
+    /* Optional caller-provided content type; default JSON. */
+    char ctype[128];
+    u64 ct_len = 0;
+    const char *ct = parse_json_string(args, "content_type", &ct_len);
+    if (ct && ct_len > 0 && ct_len < sizeof(ctype)) {
+      runtime_memcpy(ctype, ct, ct_len);
+      ctype[ct_len] = 0;
+    } else {
+      runtime_memcpy(ctype, "application/json", sizeof("application/json"));
+    }
+    ak_http_header d_headers[1];
+    d_headers[0].name = "Content-Type";
+    d_headers[0].value = ctype;
+
+    buffer resp = 0;
+    s64 st = ak_https_request(host, port, tls, AK_HTTP_METHOD_POST, path,
+                              d_headers, 1, d_body, (u32)d_body_len, &resp,
+                              30000);
+    if (st < 0) {
+      if (resp)
+        deallocate_buffer(resp);
+      return st;
+    }
+    buffer res = ak_http_build_result(ctx->agent->heap, st, resp);
+    if (resp)
+      deallocate_buffer(resp);
+    if (res == INVALID_ADDRESS)
+      return AK_E_WASM_OOM;
+    *result = res;
+    return 0;
+  }
 
   /* Check if virtio proxy is connected */
   if (!ak_proxy_connected())
@@ -782,7 +939,9 @@ s64 ak_host_tcp_recv(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
  * SECURITY CONSIDERATIONS:
  *   - All operations validate capabilities before execution
  *   - Path length is bounded to prevent buffer overflows
- *   - If proxy is not connected, operations return safe fallback values
+ *   - If the proxy is not connected, operations FAIL CLOSED with
+ *     AK_E_NOT_IMPLEMENTED - fabricated "success" results are never
+ *     returned for a backend that did not run
  *   - The akproxy daemon on the host enforces additional access controls
  *
  * PROXY PROTOCOL:
@@ -797,7 +956,7 @@ s64 ak_host_tcp_recv(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
  * ak_host_fs_read - Read file contents from WASM sandbox
  *
  * Routes through virtio proxy to read file contents from host filesystem.
- * If proxy is not connected, returns empty content as fallback.
+ * If the proxy is not connected, fails closed with AK_E_NOT_IMPLEMENTED.
  *
  * Args: {"path": "/path/to/file"}
  * Returns: {"content": "<file_contents>"}
@@ -826,12 +985,10 @@ s64 ak_host_fs_read(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   if (cap_result != 0)
     return cap_result;
 
-  /* Check if virtio proxy is connected */
-  if (!ak_proxy_connected()) {
-    /* Fallback: return empty content */
-    *result = create_json_result(ctx->agent->heap, "content", "", 0);
-    return (*result) ? 0 : AK_E_WASM_OOM;
-  }
+  /* FAIL CLOSED: without the proxy backend no read was performed, so
+   * never fabricate an empty-but-successful result */
+  if (!ak_proxy_connected())
+    return AK_E_NOT_IMPLEMENTED;
 
   /* Read file via virtio proxy */
   buffer content = 0;
@@ -856,7 +1013,7 @@ s64 ak_host_fs_read(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
  * ak_host_fs_write - Write file contents from WASM sandbox
  *
  * Routes through virtio proxy to write file contents to host filesystem.
- * If proxy is not connected, returns 0 bytes written as fallback.
+ * If the proxy is not connected, fails closed with AK_E_NOT_IMPLEMENTED.
  *
  * Args: {"path": "/path/to/file", "content": "data to write"}
  * Returns: {"bytes_written": "<num_bytes>"}
@@ -885,12 +1042,10 @@ s64 ak_host_fs_write(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   if (cap_result != 0)
     return cap_result;
 
-  /* Check if virtio proxy is connected */
-  if (!ak_proxy_connected()) {
-    /* Fallback: return 0 bytes written */
-    *result = create_json_result(ctx->agent->heap, "bytes_written", "0", 1);
-    return (*result) ? 0 : AK_E_WASM_OOM;
-  }
+  /* FAIL CLOSED: without the proxy backend no write was performed, so
+   * never report a fabricated "0 bytes written" success */
+  if (!ak_proxy_connected())
+    return AK_E_NOT_IMPLEMENTED;
 
   /* Parse content from args */
   u64 content_len;
@@ -968,16 +1123,10 @@ s64 ak_host_fs_stat(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   if (cap_result != 0)
     return cap_result;
 
-  /* Check if virtio proxy is connected */
-  if (!ak_proxy_connected()) {
-    /* Fallback: return placeholder indicating file doesn't exist */
-    buffer res = allocate_buffer(ctx->agent->heap, 64);
-    if (!res || res == INVALID_ADDRESS)
-      return AK_E_WASM_OOM;
-    buffer_write(res, "{\"size\": 0, \"exists\": false}", 28);
-    *result = res;
-    return 0;
-  }
+  /* FAIL CLOSED: without the proxy backend nothing was stat'd, so
+   * never fabricate an "exists: false" answer */
+  if (!ak_proxy_connected())
+    return AK_E_NOT_IMPLEMENTED;
 
   /* Get file info via virtio proxy */
   ak_file_info_t info;
@@ -1088,16 +1237,10 @@ s64 ak_host_fs_list(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   if (cap_result != 0)
     return cap_result;
 
-  /* Check if virtio proxy is connected */
-  if (!ak_proxy_connected()) {
-    /* Fallback: return empty array */
-    buffer res = allocate_buffer(ctx->agent->heap, 64);
-    if (!res || res == INVALID_ADDRESS)
-      return AK_E_WASM_OOM;
-    buffer_write(res, "{\"entries\": [], \"count\": 0}", 27);
-    *result = res;
-    return 0;
-  }
+  /* FAIL CLOSED: without the proxy backend no listing was performed,
+   * so never fabricate an empty directory */
+  if (!ak_proxy_connected())
+    return AK_E_NOT_IMPLEMENTED;
 
   /* List directory via virtio proxy */
   ak_file_info_t *entries = NULL;
@@ -1240,23 +1383,94 @@ s64 ak_host_heap_read(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   /* Initialize *result to NULL to ensure defined state on error paths */
   *result = NULL;
 
+  /* Null check for ctx->agent before dereferencing */
+  if (!ctx || !ctx->agent)
+    return AK_E_CAP_MISSING;
+
   u64 ptr_len;
   const char *ptr_str = parse_json_string(args, "ptr", &ptr_len);
   if (!ptr_str || ptr_len == 0)
     return AK_E_SCHEMA_INVALID;
 
-  /* Capability check for heap access */
-  s64 cap_result = validate_host_cap(ctx, AK_CAP_HEAP, "*", "read");
+  /* Convert pointer string to null-terminated buffer for capability check */
+  char ptr_buf[64];
+  /* SECURITY: Return error instead of truncating to prevent security bypass */
+  if (ptr_len >= sizeof(ptr_buf))
+    return AK_E_SCHEMA_INVALID;
+  runtime_memcpy(ptr_buf, ptr_str, ptr_len);
+  ptr_buf[ptr_len] = 0;
+
+  /* Parse pointer string to u64 value */
+  u64 ptr = 0;
+  for (u64 i = 0; i < ptr_len; i++) {
+    if (ptr_str[i] >= '0' && ptr_str[i] <= '9') {
+      /* Check for overflow before multiplication */
+      if (ptr > (U64_MAX - (ptr_str[i] - '0')) / 10)
+        return AK_E_SCHEMA_INVALID;
+      ptr = ptr * 10 + (ptr_str[i] - '0');
+    } else {
+      /* Invalid character in pointer string */
+      return AK_E_SCHEMA_INVALID;
+    }
+  }
+
+  /* Validate capability for this specific heap pointer */
+  s64 cap_result = validate_host_cap(ctx, AK_CAP_HEAP, ptr_buf, "read");
   if (cap_result != 0)
     return cap_result;
 
   /*
-   * Read from typed heap via ak_heap_read().
-   * Integration point with ak_heap.c for WASM tool access.
+   * Read the real object from the typed heap (ak_heap.c). On failure
+   * the error is propagated - no fake value is ever returned.
    */
+  buffer value = NULL;
+  u64 version = 0;
+  ak_taint_t taint;
+  s64 err = ak_heap_read(ptr, &value, &version, &taint);
+  if (err != 0)
+    return err;
 
-  *result = create_json_result(ctx->agent->heap, "value", "{}", 2);
-  return (*result) ? 0 : AK_E_WASM_OOM;
+  /* Build result JSON: {"value": <json>, "version": <n>} */
+  buffer res = allocate_buffer(ctx->agent->heap,
+                               (value ? buffer_length(value) : 0) + 64);
+  if (!res || res == INVALID_ADDRESS) {
+    if (value)
+      deallocate_buffer(value);
+    return AK_E_WASM_OOM;
+  }
+
+  buffer_write(res, "{\"value\": ", 10);
+  if (value && buffer_length(value) > 0)
+    buffer_write(res, buffer_ref(value, 0), buffer_length(value));
+  else
+    buffer_write(res, "null", 4);
+
+  buffer_write(res, ", \"version\": ", 13);
+
+  char ver_buf[32];
+  int ver_len = 0;
+  u64 v = version;
+  if (v == 0) {
+    ver_buf[ver_len++] = '0';
+  } else {
+    char temp[32];
+    int temp_len = 0;
+    while (v > 0) {
+      temp[temp_len++] = '0' + (v % 10);
+      v /= 10;
+    }
+    for (int i = temp_len - 1; i >= 0; i--) {
+      ver_buf[ver_len++] = temp[i];
+    }
+  }
+  buffer_write(res, ver_buf, ver_len);
+  buffer_write(res, "}", 1);
+
+  if (value)
+    deallocate_buffer(value);
+
+  *result = res;
+  return 0;
 }
 
 s64 ak_host_heap_write(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
@@ -1449,11 +1663,10 @@ s64 ak_host_llm_complete(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
   if (cap_result != 0)
     return cap_result;
 
-  /* Check if virtio proxy is connected */
-  if (!ak_proxy_connected()) {
-    *result = create_json_result(ctx->agent->heap, "completion", "", 0);
-    return (*result) ? 0 : AK_E_WASM_OOM;
-  }
+  /* FAIL CLOSED: without the proxy backend no inference was performed,
+   * so never fabricate an empty-but-successful completion */
+  if (!ak_proxy_connected())
+    return AK_E_NOT_IMPLEMENTED;
 
   /* Parse optional model from args */
   u64 model_len;
@@ -1528,14 +1741,20 @@ s64 ak_host_log(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
 
   u64 msg_len;
   const char *msg = parse_json_string(args, "message", &msg_len);
+  if (!msg || msg_len == 0)
+    return AK_E_SCHEMA_INVALID;
 
   /*
-   * Log message to audit trail.
-   * No capability required - agents can always log.
+   * Log message to the kernel console (rprintf). This is a real,
+   * observable log sink; it is NOT the tamper-evident audit chain
+   * (ak_audit.c), which only records request/response hash pairs.
+   * Messages longer than the bounded copy below are truncated.
    */
-  if (msg && msg_len > 0) {
-    /* Would call ak_audit_log_event() */
-  }
+  char log_buf[256];
+  u64 copy_len = msg_len < sizeof(log_buf) - 1 ? msg_len : sizeof(log_buf) - 1;
+  runtime_memcpy(log_buf, msg, copy_len);
+  log_buf[copy_len] = 0;
+  rprintf("[AK WASM LOG] %s\n", log_buf);
 
   *result = create_json_result(ctx->agent->heap, "ok", "true", 4);
   return (*result) ? 0 : AK_E_WASM_OOM;
@@ -1550,12 +1769,29 @@ s64 ak_host_time_now(ak_wasm_exec_ctx_t *ctx, buffer args, buffer *result) {
     return AK_E_CAP_MISSING;
 
   /*
-   * Return current timestamp.
-   * No capability required.
+   * Return the current kernel time in milliseconds (monotonic clock,
+   * same source as the rest of the agentic subsystem). No capability
+   * required beyond the AK_CAP_TOOL gate at registration.
    */
+  u64 ms = ak_now_ms();
 
-  /* Would use kern_now() for actual timestamp */
-  *result = create_json_result(ctx->agent->heap, "ms", "0", 1);
+  char ms_buf[32];
+  int ms_len = 0;
+  if (ms == 0) {
+    ms_buf[ms_len++] = '0';
+  } else {
+    char temp[32];
+    int temp_len = 0;
+    while (ms > 0) {
+      temp[temp_len++] = '0' + (ms % 10);
+      ms /= 10;
+    }
+    for (int i = temp_len - 1; i >= 0; i--) {
+      ms_buf[ms_len++] = temp[i];
+    }
+  }
+
+  *result = create_json_result(ctx->agent->heap, "ms", ms_buf, ms_len);
   return (*result) ? 0 : AK_E_WASM_OOM;
 }
 

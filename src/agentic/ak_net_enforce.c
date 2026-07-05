@@ -5,10 +5,51 @@
  * Copyright (c) 2024 Authority Systems
  *
  * Implements network access control at socket syscall layer.
+ *
+ * ============================================================
+ * SECURITY MODEL (read this before changing any check)
+ * ============================================================
+ *
+ * Nanos is a single-tenant unikernel: one application per VM.
+ *
+ * IMPORTANT: ak_get_root_context() LAZILY CREATES a root context for
+ * the (single) Nanos process on first use, with NO capabilities and
+ * NO network rules (see ak_get_current_context() in ak_syscall.c).
+ * Therefore "context exists" does NOT mean "agent networking policy
+ * is in force" - every workload has a context. The enforcement gate
+ * is whether a NETWORK POLICY has been configured on that context.
+ *
+ * 1. NO NETWORK POLICY CONFIGURED (no context at all, or a context
+ *    with neither network rules nor an AK_CAP_NET root capability):
+ *    The workload is an ordinary (non-agent) process, so network
+ *    operations are ALLOWED and the data plane is not filtered or
+ *    budget-limited. This is intentional single-tenant behavior: AK
+ *    network policy governs configured agent runs, not the base OS
+ *    image. If you need to firewall non-agent workloads, do it at
+ *    the hypervisor/cloud layer.
+ *
+ * 2. NETWORK POLICY CONFIGURED (context has a network rules table -
+ *    even an empty one - or an AK_CAP_NET root capability):
+ *    FAIL-CLOSED. An operation is allowed only if:
+ *      - an explicit ALLOW rule matches (first match wins), or
+ *      - the root capability is AK_CAP_NET and its resource pattern
+ *        matches the "host:port" endpoint.
+ *    Anything else - including "rules table present but empty" - is
+ *    DENIED. This applies to connect(), bind(), accept() and DNS.
+ *
+ * 3. DATA PLANE (send/recv), only when a network policy is
+ *    configured:
+ *    Outbound sends are checked against the NET_BYTES_OUT budget and
+ *    scanned for secrets (DLP); either failure blocks the send.
+ *    Inbound receives are tracked against budget but never blocked.
+ *    If no budget tracker exists on the context, byte accounting is
+ *    skipped (budgets are an orthogonal limit, not an allow/deny
+ *    gate; the connect() gate above is the access control).
  */
 
 #include "ak_net_enforce.h"
 #include "ak_audit.h"
+#include "ak_budget.h" /* full ak_budget_tracker_t definition + lock */
 #include "ak_capability.h"
 #include "ak_sanitize.h"
 
@@ -76,53 +117,71 @@ static boolean ak_net_host_match(const char *pattern, const char *host) {
   }
 
   /* Exact match */
-  return runtime_strcmp(pattern, host) == 0;
+  return ak_strcmp(pattern, host) == 0;
 }
 
 /*
- * Check host:port against rules.
- * Returns: true if allowed, false if denied
+ * Does this context have a network policy configured?
+ *
+ * True if the context has a network rules table (even an empty one)
+ * or an AK_CAP_NET root capability. Only then does fail-closed
+ * enforcement apply; otherwise the workload is treated as a plain
+ * (non-agent) process. See SECURITY MODEL at the top of this file.
+ */
+static boolean ak_net_policy_active(ak_agent_context_t *ctx) {
+  if (!ctx)
+    return false;
+  if (ctx->network_rules)
+    return true;
+  if (ctx->root_cap && ctx->root_cap->type == AK_CAP_NET)
+    return true;
+  return false;
+}
+
+/*
+ * Check host:port against rules for a context WITH an active network
+ * policy (caller must have checked ak_net_policy_active()).
+ *
+ * FAIL-CLOSED: returns true only on an explicit ALLOW rule match
+ * (first match wins) or a matching AK_CAP_NET root capability.
+ * No match - including "rules table present but empty" - means deny.
  */
 static boolean ak_net_check_rules(ak_agent_context_t *ctx, const char *host,
                                   u16 port) {
-  if (!ctx || !ctx->network_rules)
-    return !ak_net_default_deny;
+  if (!ctx)
+    return false; /* Defensive: callers must pass an active context */
 
-  /* Iterate through rules - first match wins */
-  ak_net_rule_t *rule = (ak_net_rule_t *)table_find(ctx->network_rules, 0);
+  /* Walk rule list - first match wins (explicit DENY rules honored) */
+  if (ctx->network_rules) {
+    ak_net_rule_t *rule = (ak_net_rule_t *)table_find(ctx->network_rules, 0);
+    while (rule) {
+      /* Check port match (0 = any) */
+      if (rule->port != 0 && rule->port != port) {
+        rule = rule->next;
+        continue;
+      }
 
-  /* If no rules table or empty, check for capability */
-  if (!rule) {
-    /* Check for AK_CAP_NET capability */
+      /* Check host match */
+      if (ak_net_host_match(rule->host, host)) {
+        return (rule->type == AK_NET_RULE_ALLOW);
+      }
+
+      rule = rule->next;
+    }
+  }
+
+  /* No rule matched - fall back to the root AK_CAP_NET capability,
+   * whose resource is a pattern matched against "host:port". */
+  if (ctx->root_cap && ctx->root_cap->type == AK_CAP_NET) {
     char endpoint[320];
     ak_net_format_endpoint(host, port, endpoint);
-
-    /* Look for a matching network capability */
-    if (ctx->root_cap && ctx->root_cap->type == AK_CAP_NET) {
-      if (ak_pattern_match((const char *)ctx->root_cap->resource, endpoint))
-        return true;
-    }
-
-    return !ak_net_default_deny;
+    if (ak_pattern_match((const char *)ctx->root_cap->resource, endpoint))
+      return true;
   }
 
-  /* Walk rule list */
-  while (rule) {
-    /* Check port match (0 = any) */
-    if (rule->port != 0 && rule->port != port) {
-      rule = rule->next;
-      continue;
-    }
-
-    /* Check host match */
-    if (ak_net_host_match(rule->host, host)) {
-      return (rule->type == AK_NET_RULE_ALLOW);
-    }
-
-    rule = rule->next;
-  }
-
-  /* No rule matched - use default */
+  /* Nothing allowed it: deny (fail-closed; see SECURITY MODEL above).
+   * ak_net_default_deny is always true; it exists so the policy is
+   * explicit at initialization time. */
   return !ak_net_default_deny;
 }
 
@@ -138,12 +197,13 @@ s64 ak_net_check_connect(const char *host, u16 port, boolean is_ipv6) {
 
   /* Get current agent context */
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
-    /* No agent context - allow for non-agent processes */
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: non-agent workload, allow.
+     * (Single-tenant behavior; see SECURITY MODEL at top of file.) */
     return 0;
   }
 
-  /* Check rules */
+  /* Network policy configured: FAIL-CLOSED rule/capability check */
   boolean allowed = ak_net_check_rules(ctx, host, port);
 
   /* Audit log the attempt */
@@ -157,26 +217,50 @@ s64 ak_net_check_connect(const char *host, u16 port, boolean is_ipv6) {
 }
 
 s64 ak_net_check_bind(u16 port, boolean is_ipv6) {
-  (void)is_ipv6;
-
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
-    return 0; /* Allow for non-agent processes */
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: non-agent workload, allow.
+     * (Single-tenant behavior; see SECURITY MODEL at top of file.) */
+    return 0;
   }
 
-  /* For now, allow all binds - could restrict to specific ports */
-  ak_net_audit_log("bind", "0.0.0.0", port, true, 0);
+  /* Network policy configured: FAIL-CLOSED. Binding (listening) is allowed
+   * only if a rule or the root capability permits the wildcard local
+   * address for this port. A rule with host "*" (any port or matching
+   * port) permits serving; otherwise the bind is denied. */
+  const char *bind_host = is_ipv6 ? "::" : "0.0.0.0";
+  boolean allowed = ak_net_check_rules(ctx, bind_host, port);
+
+  ak_net_audit_log("bind", bind_host, port, allowed, 0);
+
+  if (!allowed) {
+    return -EACCES;
+  }
+
   return 0;
 }
 
 s64 ak_net_check_accept(const char *client_host, u16 client_port) {
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: non-agent workload, allow.
+     * (Single-tenant behavior; see SECURITY MODEL at top of file.) */
     return 0;
   }
 
-  /* For now, allow all accepts - could filter by client */
-  ak_net_audit_log("accept", client_host, client_port, true, 0);
+  /* Network policy configured: FAIL-CLOSED. The inbound peer must match an
+   * ALLOW rule or the root capability. An unknown peer address can
+   * only be admitted by a wildcard ("*") rule. */
+  if (!client_host)
+    client_host = "unknown";
+  boolean allowed = ak_net_check_rules(ctx, client_host, client_port);
+
+  ak_net_audit_log("accept", client_host, client_port, allowed, 0);
+
+  if (!allowed) {
+    return -EACCES;
+  }
+
   return 0;
 }
 
@@ -187,40 +271,42 @@ s64 ak_net_check_accept(const char *client_host, u16 client_port) {
 s64 ak_net_filter_send(u8 *data, u64 len, const char *dest_host,
                        u16 dest_port) {
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
-    return 0; /* No filtering for non-agent processes */
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: non-agent workload, no filtering.
+     * Budget limits and DLP scanning apply only to configured agent
+     * runs; otherwise every plain app would hit the default
+     * NET_BYTES_OUT budget and DLP false positives (e.g. an app
+     * legitimately sending its own bearer tokens).
+     * (Single-tenant behavior; see SECURITY MODEL at top of file.) */
+    return 0;
   }
 
-  /* Check budget */
+  /* Check-and-consume NET_BYTES_OUT budget atomically (the tracker
+   * lock is the same one ak_budget.c uses for admission control). */
   if (ctx->budget) {
-    u64 used = ctx->budget->budgets.used[AK_RESOURCE_NET_BYTES_OUT];
-    u64 limit = ctx->budget->budgets.limits[AK_RESOURCE_NET_BYTES_OUT];
+    ak_budget_tracker_t *tracker = ctx->budget;
+    spin_lock(&tracker->lock);
+    u64 used = tracker->budget.used[AK_RESOURCE_NET_BYTES_OUT];
+    u64 limit = tracker->budget.limits[AK_RESOURCE_NET_BYTES_OUT];
     if (limit > 0 && used + len > limit) {
+      spin_unlock(&tracker->lock);
       ak_net_audit_log("send_blocked", dest_host, dest_port, false, len);
       return AK_E_BUDGET_EXCEEDED;
     }
-    /* Update usage */
-    ctx->budget->budgets.used[AK_RESOURCE_NET_BYTES_OUT] += len;
+    tracker->budget.used[AK_RESOURCE_NET_BYTES_OUT] += len;
+    spin_unlock(&tracker->lock);
   }
 
-  /* DLP: Scan for secrets */
-  if (data && len > 0 && ak_net_heap) {
-    /* Create buffer wrapper for scanning */
-    buffer scan_buf = allocate_buffer(ak_net_heap, len);
-    if (scan_buf) {
-      buffer_write(scan_buf, data, len);
-
-      /* Check for secrets */
-      u32 detected = ak_dlp_detect_secrets(scan_buf, AK_DLP_PATTERN_ALL);
-
-      if (detected) {
-        /* Secrets detected - block the send */
-        deallocate_buffer(scan_buf);
-        ak_net_audit_log("send_dlp_block", dest_host, dest_port, false, len);
-        return AK_E_DLP_BLOCK;
-      }
-
-      deallocate_buffer(scan_buf);
+  /* DLP: scan outbound bytes for secrets. The stack-allocated wrapper
+   * avoids any heap dependency, so scanning is always active for agent
+   * contexts (no fail-open when ak_net_init() has not run). */
+  if (data && len > 0) {
+    buffer scan_buf = ak_wrap_buffer(data, len);
+    u32 detected = ak_dlp_detect_secrets(scan_buf, AK_DLP_PATTERN_ALL);
+    if (detected) {
+      /* Secrets detected - block the send */
+      ak_net_audit_log("send_dlp_block", dest_host, dest_port, false, len);
+      return AK_E_DLP_BLOCK;
     }
   }
 
@@ -232,13 +318,18 @@ s64 ak_net_filter_send(u8 *data, u64 len, const char *dest_host,
 
 s64 ak_net_track_recv(u64 len, const char *src_host, u16 src_port) {
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: nothing to track (see SECURITY
+     * MODEL at top of file). */
     return 0;
   }
 
   /* Track bytes against budget (but don't block inbound) */
   if (ctx->budget) {
-    ctx->budget->budgets.used[AK_RESOURCE_NETWORK_BYTES] += len;
+    ak_budget_tracker_t *tracker = ctx->budget;
+    spin_lock(&tracker->lock);
+    tracker->budget.used[AK_RESOURCE_NETWORK_BYTES] += len;
+    spin_unlock(&tracker->lock);
   }
 
   /* Audit the receive */
@@ -256,12 +347,15 @@ s64 ak_net_check_dns(const char *domain) {
     return -EINVAL;
 
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx) {
-    return 0; /* Allow for non-agent processes */
+  if (!ak_net_policy_active(ctx)) {
+    /* No network policy configured: non-agent workload, allow.
+     * (Single-tenant behavior; see SECURITY MODEL at top of file.) */
+    return 0;
   }
 
-  /* Check if domain resolution is allowed via rules */
-  /* DNS uses port 53, but we check against the domain itself */
+  /* Network policy configured: FAIL-CLOSED. The domain must match an
+   * ALLOW rule or the root capability (checked against the domain
+   * itself, with port 0 = any). */
   boolean allowed = ak_net_check_rules(ctx, domain, 0);
 
   ak_net_audit_log("dns", domain, 53, allowed, 0);
@@ -270,14 +364,10 @@ s64 ak_net_check_dns(const char *domain) {
     return -EACCES;
   }
 
-#ifdef CONFIG_AGENTIC
-  /* Also check through the POSIX routing layer if available */
-  extern sysreturn ak_route_dns_resolve(const char *hostname);
-  sysreturn route_ret = ak_route_dns_resolve(domain);
-  if (route_ret < 0) {
-    return route_ret;
-  }
-#endif
+  /* NOTE: the POSIX routing layer (ak_posix_route.c) is not part of
+   * the kernel build, so no additional routing-layer DNS check is
+   * performed here. If ak_posix_route.c is ever added to the compiled
+   * set, its ak_route_dns_resolve() can be consulted here as well. */
 
   return 0;
 }
@@ -287,21 +377,27 @@ s64 ak_net_check_dns(const char *domain) {
  * ============================================================ */
 
 s64 ak_net_add_rule(ak_net_rule_type_t type, const char *host, u16 port) {
-  if (!host || !ak_net_heap)
+  if (!host)
     return -EINVAL;
 
   ak_agent_context_t *ctx = ak_get_root_context();
   if (!ctx)
     return -EINVAL;
 
+  /* Prefer the heap given to ak_net_init(); fall back to the context
+   * heap so rules can be installed even if init has not run. */
+  heap h = ak_net_heap ? ak_net_heap : ctx->heap;
+  if (!h)
+    return -EINVAL;
+
   /* Allocate rule */
-  ak_net_rule_t *rule = allocate(ak_net_heap, sizeof(ak_net_rule_t));
-  if (!rule)
+  ak_net_rule_t *rule = allocate(h, sizeof(ak_net_rule_t));
+  if (!rule || rule == INVALID_ADDRESS)
     return -ENOMEM;
 
   rule->type = type;
   rule->port = port;
-  runtime_memset(rule->host, 0, sizeof(rule->host));
+  runtime_memset((u8 *)rule->host, 0, sizeof(rule->host));
 
   u64 len = runtime_strlen(host);
   if (len >= sizeof(rule->host))
@@ -310,8 +406,12 @@ s64 ak_net_add_rule(ak_net_rule_type_t type, const char *host, u16 port) {
 
   /* Initialize rules table if needed */
   if (!ctx->network_rules) {
-    ctx->network_rules =
-        allocate_table(ak_net_heap, identity_key, pointer_equal);
+    ctx->network_rules = allocate_table(h, identity_key, pointer_equal);
+    if (!ctx->network_rules || ctx->network_rules == INVALID_ADDRESS) {
+      ctx->network_rules = NULL;
+      deallocate(h, rule, sizeof(ak_net_rule_t));
+      return -ENOMEM;
+    }
   }
 
   /* Add to front of list (table stores head pointer at key 0) */
@@ -323,14 +423,20 @@ s64 ak_net_add_rule(ak_net_rule_type_t type, const char *host, u16 port) {
 
 void ak_net_clear_rules(void) {
   ak_agent_context_t *ctx = ak_get_root_context();
-  if (!ctx || !ctx->network_rules || !ak_net_heap)
+  if (!ctx || !ctx->network_rules)
+    return;
+
+  /* Use the same heap-selection logic as ak_net_add_rule() so rules
+   * are returned to the heap they came from. */
+  heap h = ak_net_heap ? ak_net_heap : ctx->heap;
+  if (!h)
     return;
 
   /* Free all rules */
   ak_net_rule_t *rule = (ak_net_rule_t *)table_find(ctx->network_rules, 0);
   while (rule) {
     ak_net_rule_t *next = rule->next;
-    deallocate(ak_net_heap, rule, sizeof(ak_net_rule_t));
+    deallocate(h, rule, sizeof(ak_net_rule_t));
     rule = next;
   }
 
@@ -365,31 +471,31 @@ static u16 ak_net_event_to_op(const char *event) {
   /* Use first character for fast dispatch, then verify */
   switch (event[0]) {
   case 'c':
-    if (runtime_strcmp(event, "connect") == 0)
+    if (ak_strcmp(event, "connect") == 0)
       return AK_NET_OP_CONNECT;
     break;
   case 'b':
-    if (runtime_strcmp(event, "bind") == 0)
+    if (ak_strcmp(event, "bind") == 0)
       return AK_NET_OP_BIND;
     break;
   case 'a':
-    if (runtime_strcmp(event, "accept") == 0)
+    if (ak_strcmp(event, "accept") == 0)
       return AK_NET_OP_ACCEPT;
     break;
   case 's':
-    if (runtime_strcmp(event, "send") == 0)
+    if (ak_strcmp(event, "send") == 0)
       return AK_NET_OP_SEND;
-    if (runtime_strcmp(event, "send_blocked") == 0)
+    if (ak_strcmp(event, "send_blocked") == 0)
       return AK_NET_OP_SEND_BLOCKED;
-    if (runtime_strcmp(event, "send_dlp_block") == 0)
+    if (ak_strcmp(event, "send_dlp_block") == 0)
       return AK_NET_OP_DLP_BLOCK;
     break;
   case 'r':
-    if (runtime_strcmp(event, "recv") == 0)
+    if (ak_strcmp(event, "recv") == 0)
       return AK_NET_OP_RECV;
     break;
   case 'd':
-    if (runtime_strcmp(event, "dns") == 0)
+    if (ak_strcmp(event, "dns") == 0)
       return AK_NET_OP_DNS;
     break;
   }

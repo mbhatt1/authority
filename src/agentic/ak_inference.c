@@ -5,15 +5,17 @@
  * Copyright (c) 2024 Authority Systems
  *
  * Provides LLM inference capabilities for Authority agents:
- *   - Local inference via virtio-serial to host inference server
- *   - External API calls via HTTPS (OpenAI, Anthropic, custom)
+ *   - Local inference via the host akproxy over virtio-serial
+ *   - External API access (OpenAI, Anthropic, custom) ONLY via the
+ *     host proxy; there is no in-kernel TLS/HTTP stack, so direct
+ *     external requests fail closed
  *   - Capability-gated access enforcement (INV-2)
  *   - Budget tracking and enforcement (INV-3)
  *   - Full audit logging of all inference calls (INV-4)
  *
  * Architecture:
- *   Guest VM <-> virtio-serial <-> Host inference server (local mode)
- *   Guest VM <-> TCP/TLS <-> External API endpoint (external mode)
+ *   Guest VM <-> virtio-serial <-> host akproxy <-> local or external
+ *   inference backend (proxy performs any HTTPS on the host side)
  */
 
 #include "ak_inference.h"
@@ -21,8 +23,10 @@
 #include "ak_budget.h"
 #include "ak_compat.h"
 #include "ak_policy.h"
+#include "ak_secrets.h"
 #include "ak_stream.h"
 #include "ak_syscall.h"
+#include "ak_transport.h"
 #include "ak_virtio_proxy.h"
 
 /* ============================================================
@@ -322,8 +326,18 @@ ak_llm_mode_t ak_inference_route(const char *model) {
 
   if (ak_inf_state.config.mode == AK_LLM_LOCAL)
     return AK_LLM_LOCAL;
+
+  /*
+   * External API calls cannot be made in-kernel (no TLS/HTTP stack).
+   * The only working transport is the host akproxy (virtio-serial),
+   * which performs any HTTPS on the host side. If the proxy is
+   * connected, route would-be-external requests through the local
+   * proxy path. Otherwise return AK_LLM_EXTERNAL so the caller gets
+   * the honest fail-closed error from ak_external_inference_request()
+   * - never a hang or a fabricated success.
+   */
   if (ak_inf_state.config.mode == AK_LLM_EXTERNAL)
-    return AK_LLM_EXTERNAL;
+    return ak_proxy_connected() ? AK_LLM_LOCAL : AK_LLM_EXTERNAL;
 
   /* Hybrid mode: route based on model name */
   if (ak_inf_state.config.mode == AK_LLM_HYBRID) {
@@ -331,7 +345,8 @@ ak_llm_mode_t ak_inference_route(const char *model) {
       if (ak_strcmp(model, ak_inf_state.config.local_models[i]) == 0)
         return AK_LLM_LOCAL;
     }
-    return AK_LLM_EXTERNAL;
+    /* Unknown models would go external; see comment above */
+    return ak_proxy_connected() ? AK_LLM_LOCAL : AK_LLM_EXTERNAL;
   }
 
   return AK_LLM_MODE_DISABLED;
@@ -355,51 +370,32 @@ s64 ak_local_inference_init(ak_llm_local_config_t *config) {
   if (!config)
     return AK_E_LLM_NOT_CONFIGURED;
 
-  ak_inf_state.local_connected = false;
   ak_inf_state.local_fd = -1;
 
+  /*
+   * The working local transport is the host akproxy (virtio-serial),
+   * brought up separately via ak_proxy_init(). Reflect its real,
+   * current availability instead of pretending a device was opened.
+   *
+   * Note: local_fd stays -1, so the legacy length-prefixed protocol
+   * in virtio_request() remains fail-closed regardless of this flag;
+   * requests are served exclusively through ak_proxy_llm_complete().
+   */
+  ak_inf_state.local_connected = ak_proxy_connected();
+  if (ak_inf_state.local_connected)
+    return 0;
+
+  /*
+   * Legacy direct virtio-serial device path: the driver integration
+   * with the Nanos file descriptor API is not implemented, so the
+   * device at config->device_path cannot be opened here. Fail closed
+   * with an honest status; ak_local_inference_request() will reject
+   * requests until the proxy comes up.
+   */
   if (config->device_path[0] == 0)
     return AK_E_LLM_NOT_CONFIGURED;
 
-  /*
-   * Virtio-serial Device Initialization
-   *
-   * The local inference backend communicates with a host-side inference
-   * server via virtio-serial. This requires:
-   *
-   *   1. QEMU Configuration: The VM must be launched with a virtio-serial
-   *      device configured, e.g.:
-   *        -device virtio-serial-pci \
-   *        -chardev socket,id=inference,path=/tmp/inference.sock \
-   *        -device virtserialport,chardev=inference,name=inference
-   *
-   *   2. Host Server: An inference server (ollama, vLLM, or custom) must
-   *      be listening on the socket and implementing the length-prefixed
-   *      JSON protocol defined in this file.
-   *
-   *   3. Device Path: The device_path should match the virtio-serial port
-   *      name, typically /dev/vport0p1 or a named port.
-   *
-   * Device Opening Status:
-   *   The virtio-serial device driver integration with the Nanos file
-   *   descriptor API is pending. When implemented, this function will:
-   *     1. Open the device at config->device_path
-   *     2. Set non-blocking mode for async I/O
-   *     3. Validate connectivity with a health check
-   *     4. Set local_connected = true on success
-   *
-   * Current State:
-   *   Device remains unavailable (local_connected = false) until the
-   *   virtio-serial driver integration is complete. Callers should check
-   *   ak_local_inference_healthy() before attempting requests.
-   *
-   * Error Handling:
-   *   Returns 0 to indicate successful initialization of the local
-   *   inference subsystem configuration. The actual device availability
-   *   is tracked separately via local_connected flag.
-   */
-
-  return 0;
+  return AK_E_LLM_DEVICE_UNAVAILABLE;
 }
 
 /*
@@ -433,8 +429,8 @@ is_transient_error(s64 error_code) {
 /*
  * Sleep for exponential backoff delay.
  *
- * Implements exponential backoff with jitter to avoid thundering herd.
- * Delay = base_ms * 2^attempt + random(0, base_ms/2)
+ * Implements exponential backoff to avoid hammering the device.
+ * Delay = base_ms * 2^attempt, capped at 5 seconds.
  */
 static void __attribute__((unused)) virtio_backoff_delay(u32 attempt,
                                                          u32 base_ms) {
@@ -443,15 +439,16 @@ static void __attribute__((unused)) virtio_backoff_delay(u32 attempt,
     delay_ms = 5000; /* Cap at 5 seconds */
 
   /*
-   * Simple delay implementation.
-   * In a full implementation, this would use kern_pause() or similar.
-   * For now, we spin-wait (not ideal, but functional).
+   * Bounded wait with kern_pause() (arch pause/yield hint), the same
+   * pattern used by ak_audit sync and ak_state. A blocking scheduler
+   * sleep is not safely reachable from this context, so this remains
+   * a polling wait - but never a pure hot spin, and always bounded by
+   * the target deadline above.
    */
   u64 start = now(CLOCK_ID_MONOTONIC);
   u64 target = start + (u64)delay_ms * MILLION;
-  while (now(CLOCK_ID_MONOTONIC) < target) {
-    /* Yield CPU - in production, use proper scheduler yield */
-  }
+  while (now(CLOCK_ID_MONOTONIC) < target)
+    kern_pause();
 }
 
 /*
@@ -942,7 +939,19 @@ ak_local_inference_request(ak_inference_request_t *req) {
       return res;
     }
 
-    /* Fall through to legacy virtio protocol if proxy fails */
+    /*
+     * Proxy request failed. The legacy virtio fd path below cannot
+     * serve a retry (device never opens), so report the proxy error
+     * honestly instead of masking it with "not connected".
+     */
+    ak_proxy_free_llm_response(&proxy_res);
+    res->success = false;
+    res->error_code =
+        (err == AK_PROXY_E_TIMEOUT) ? AK_E_LLM_TIMEOUT
+                                    : AK_E_LLM_CONNECTION_FAILED;
+    runtime_memcpy(res->error_message, "Host proxy LLM request failed",
+                   sizeof("Host proxy LLM request failed"));
+    return res;
   }
 
   if (!ak_inf_state.local_connected || ak_inf_state.local_fd < 0) {
@@ -1031,6 +1040,15 @@ ak_local_inference_request(ak_inference_request_t *req) {
 }
 
 boolean ak_local_inference_healthy(void) {
+  /*
+   * Live check: the working local path is the host akproxy. Do not
+   * trust the snapshot taken at init - the proxy may have come up or
+   * gone down since then.
+   */
+  if (ak_proxy_connected())
+    return true;
+
+  /* Legacy direct device path (never connected until driver lands) */
   return ak_inf_state.local_connected && ak_inf_state.local_fd >= 0;
 }
 
@@ -1417,26 +1435,154 @@ ak_external_inference_request(ak_inference_request_t *req,
   }
 
   /*
-   * HTTP request would be sent here using Nanos TCP/TLS stack.
-   * The implementation requires:
-   * 1. DNS resolution of endpoint hostname
-   * 2. TCP connection to port 443
-   * 3. TLS handshake
-   * 4. HTTP POST with headers and body
-   * 5. Parse HTTP response
+   * IN-KERNEL HTTPS PATH.
    *
-   * This requires integration with Nanos networking subsystem.
+   * When a transport klib (klib/ak_https.c) is loaded it registers a
+   * net_http_req-backed thunk into the kernel transport hook, and
+   * ak_https_request() can make a real TLS request from here. When no
+   * transport is registered we FAIL CLOSED with the honest
+   * AK_E_LLM_CONNECTION_FAILED - never a fabricated response.
+   *
+   * (When the host akproxy is connected, ak_inference_route() diverts
+   * would-be-external requests to the local/proxy path before this
+   * function is reached; so this path is the direct-HTTPS fallback.)
    */
+  if (!ak_transport_available()) {
+    deallocate_buffer(request_body);
+    res->success = false;
+    res->error_code = AK_E_LLM_CONNECTION_FAILED;
+    runtime_memcpy(res->error_message,
+                   "External API unavailable: no HTTPS transport klib loaded",
+                   sizeof("External API unavailable: no HTTPS transport klib loaded"));
+    return res;
+  }
+
+  /* Provider-specific host / path. */
+  const char *host;
+  const char *path;
+  if (api_config->provider == AK_LLM_PROVIDER_ANTHROPIC) {
+    host = "api.anthropic.com";
+    path = "/v1/messages";
+  } else {
+    /* OpenAI-compatible (OPENAI / CUSTOM / LOCAL formatting). */
+    host = "api.openai.com";
+    path = "/v1/chat/completions";
+  }
+
+  /*
+   * Resolve the API key. Prefer the pre-resolved key; otherwise resolve
+   * the configured secret name (internal use, no capability required).
+   */
+  char api_key[512];
+  api_key[0] = 0;
+  if (ak_inf_state.api_key_valid && ak_inf_state.api_key_resolved[0]) {
+    u64 kl = runtime_strlen(ak_inf_state.api_key_resolved);
+    if (kl >= sizeof(api_key))
+      kl = sizeof(api_key) - 1;
+    runtime_memcpy(api_key, ak_inf_state.api_key_resolved, kl);
+    api_key[kl] = 0;
+  } else if (api_config->secret_name[0]) {
+    buffer kb = ak_secret_resolve(ak_inf_state.h, api_config->secret_name,
+                                  runtime_strlen(api_config->secret_name), 0);
+    if (kb && kb != INVALID_ADDRESS) {
+      u64 kl = buffer_length(kb);
+      if (kl >= sizeof(api_key))
+        kl = sizeof(api_key) - 1;
+      runtime_memcpy(api_key, buffer_ref(kb, 0), kl);
+      api_key[kl] = 0;
+      ak_secret_clear(kb);
+    }
+  }
+
+  if (api_key[0] == 0) {
+    deallocate_buffer(request_body);
+    res->success = false;
+    res->error_code = AK_E_LLM_NOT_CONFIGURED;
+    runtime_memcpy(res->error_message, "API key unavailable",
+                   sizeof("API key unavailable"));
+    return res;
+  }
+
+  /* Build headers. */
+  ak_http_header headers[4];
+  u32 header_count = 0;
+  headers[header_count].name = "Content-Type";
+  headers[header_count].value = "application/json";
+  header_count++;
+
+  char auth_value[600];
+  if (api_config->provider == AK_LLM_PROVIDER_ANTHROPIC) {
+    headers[header_count].name = "x-api-key";
+    headers[header_count].value = api_key;
+    header_count++;
+    headers[header_count].name = "anthropic-version";
+    headers[header_count].value = "2023-06-01";
+    header_count++;
+  } else {
+    /* "Bearer " + key */
+    runtime_memcpy(auth_value, "Bearer ", 7);
+    u64 kl = runtime_strlen(api_key);
+    if (kl > sizeof(auth_value) - 8)
+      kl = sizeof(auth_value) - 8;
+    runtime_memcpy(auth_value + 7, api_key, kl);
+    auth_value[7 + kl] = 0;
+    headers[header_count].name = "Authorization";
+    headers[header_count].value = auth_value;
+    header_count++;
+  }
+
+  u32 timeout_ms = api_config->timeout_ms ? api_config->timeout_ms : 30000;
+  buffer resp = 0;
+  s64 http_status = ak_https_request(
+      host, 443, true, AK_HTTP_METHOD_POST, path, headers, header_count,
+      buffer_ref(request_body, 0), buffer_length(request_body), &resp,
+      timeout_ms);
+
+  /* Wipe key material from the stack. */
+  runtime_memset((u8 *)api_key, 0, sizeof(api_key));
+  runtime_memset((u8 *)auth_value, 0, sizeof(auth_value));
 
   deallocate_buffer(request_body);
 
-  res->success = false;
-  res->error_code = AK_E_LLM_CONNECTION_FAILED;
-  runtime_memcpy(res->error_message,
-                 "External API requires network integration",
-                 sizeof("External API requires network integration"));
+  if (http_status < 0 || !resp) {
+    if (resp)
+      deallocate_buffer(resp);
+    res->success = false;
+    res->error_code = (http_status == AK_E_TIMEOUT) ? AK_E_LLM_TIMEOUT
+                                                     : AK_E_LLM_CONNECTION_FAILED;
+    runtime_memcpy(res->error_message, "HTTPS request failed",
+                   sizeof("HTTPS request failed"));
+    return res;
+  }
 
-  return res;
+  if (http_status < 200 || http_status >= 300) {
+    deallocate_buffer(resp);
+    res->success = false;
+    res->error_code = AK_E_LLM_API_ERROR;
+    runtime_memcpy(res->error_message, "API returned non-2xx status",
+                   sizeof("API returned non-2xx status"));
+    return res;
+  }
+
+  /* Parse the successful response. ak_parse_api_response() allocates its
+   * own response object; hand back that one and free our placeholder. */
+  ak_inference_response_t *parsed =
+      ak_parse_api_response(ak_inf_state.h, api_config->provider, resp);
+  deallocate_buffer(resp);
+  deallocate(ak_inf_state.h, res, sizeof(ak_inference_response_t));
+
+  if (!parsed) {
+    ak_inference_response_t *err =
+        allocate(ak_inf_state.h, sizeof(ak_inference_response_t));
+    if (err == INVALID_ADDRESS)
+      return 0;
+    runtime_memset((u8 *)err, 0, sizeof(ak_inference_response_t));
+    err->success = false;
+    err->error_code = AK_E_LLM_MALFORMED_RESPONSE;
+    return err;
+  }
+
+  return parsed;
 }
 
 /* ============================================================
@@ -1517,6 +1663,8 @@ ak_inference_response_t *ak_inference_complete(ak_agent_context_t *agent,
     runtime_memset((u8 *)res, 0, sizeof(ak_inference_response_t));
     res->success = false;
     res->error_code = AK_E_LLM_NOT_CONFIGURED;
+    runtime_memcpy(res->error_message, "No LLM backend configured",
+                   sizeof("No LLM backend configured"));
     return res;
   }
 
@@ -1940,8 +2088,9 @@ ak_inference_response_t *ak_inference_embed(ak_agent_context_t *agent,
 
   res->success = false;
   res->error_code = AK_E_LLM_NOT_CONFIGURED;
-  runtime_memcpy(res->error_message, "Embeddings require external API",
-                 sizeof("Embeddings require external API"));
+  runtime_memcpy(res->error_message,
+                 "Embeddings unavailable: no local or proxy embedding support",
+                 sizeof("Embeddings unavailable: no local or proxy embedding support"));
   return res;
 }
 

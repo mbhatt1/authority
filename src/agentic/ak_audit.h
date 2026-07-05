@@ -63,7 +63,14 @@ s64 ak_audit_append_request(ak_request_t *req, ak_response_t *res,
  * Query log entries.
  *
  * Returns entries matching filter in [start_seq, end_seq].
- * Caller must free returned array.
+ *
+ * OWNERSHIP: The returned array is allocated from h; the caller must
+ * free the ARRAY itself (deallocate(h, results,
+ * sizeof(ak_log_entry_t *) * count)). The ak_log_entry_t pointers it
+ * contains are BORROWED - they point into live segment storage owned
+ * by the audit log. Callers must NOT free or modify them. Segments
+ * are never freed or relocated, so the borrowed pointers remain valid
+ * for the lifetime of the kernel.
  */
 typedef struct ak_log_query_filter {
   u8 *pid;    /* NULL = any */
@@ -115,7 +122,14 @@ boolean ak_audit_verify_entry(ak_log_entry_t *entry, u8 *expected_prev);
 /* ============================================================
  * ANCHORING (External Commitments)
  * ============================================================
- * Anchors prevent undetected log rewrite.
+ * LIMITATION: Anchors are currently UNSIGNED (the signature field is
+ * zeroed; no signing key is provisioned) and are held in memory only
+ * (ak_audit_post_anchor_remote is a no-op stub). They serve as
+ * internal checkpoints of (log_seq, head hash) for consistency
+ * checks, but do NOT yet provide externally verifiable tamper
+ * evidence, and do NOT prevent log rewrite by an attacker who
+ * controls this host. Full anchoring requires signing plus posting
+ * to an external service.
  */
 
 /*
@@ -139,7 +153,8 @@ boolean ak_audit_verify_anchor(ak_anchor_t *anchor);
 /*
  * Post anchor to remote service (optional).
  *
- * Failures are logged but don't block execution.
+ * NOT IMPLEMENTED: currently a no-op stub. Nothing is transmitted and
+ * no external commitment is made.
  */
 void ak_audit_post_anchor_remote(ak_anchor_t *anchor, const char *url);
 

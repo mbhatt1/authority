@@ -5,8 +5,16 @@
  * Copyright (c) 2024 Authority Systems
  *
  * Provides a unified interface for LLM inference, supporting:
- *   1. Local models via virtio-serial (host runs ollama/vLLM)
- *   2. External APIs via HTTPS (OpenAI, Anthropic, etc.)
+ *   1. Local models via the host akproxy over virtio-serial
+ *      (host runs ollama/vLLM/akproxy)
+ *   2. External APIs (OpenAI, Anthropic, etc.) via EITHER the host proxy
+ *      OR real in-kernel HTTPS. In-kernel HTTPS works when the transport
+ *      klib (klib/ak_https.c) is loaded: it registers a net_http_req /
+ *      mbedTLS-backed transport into the kernel hook (see ak_transport.h)
+ *      and ak_external_inference_request() issues a real TLS request.
+ *      When NO transport klib is loaded and the proxy is down, external
+ *      requests fail closed with AK_E_LLM_CONNECTION_FAILED - never a
+ *      fabricated response.
  *
  * All inference calls are:
  *   - Capability-gated (AK_CAP_INFERENCE)
@@ -28,8 +36,10 @@
 
 typedef enum ak_llm_mode {
   AK_LLM_MODE_DISABLED = 0, /* No LLM access */
-  AK_LLM_LOCAL = 1,         /* Local model via virtio-serial */
-  AK_LLM_EXTERNAL = 2,      /* External API via HTTPS */
+  AK_LLM_LOCAL = 1,         /* Local model via virtio-serial (akproxy) */
+  AK_LLM_EXTERNAL = 2,      /* External API; served via host proxy or via
+                             * real in-kernel HTTPS when the ak_https
+                             * transport klib is loaded */
   AK_LLM_HYBRID = 3,        /* Both available, route by model */
 } ak_llm_mode_t;
 
@@ -271,6 +281,17 @@ ak_response_t *ak_handle_inference(ak_agent_context_t *ctx, ak_request_t *req);
 
 /*
  * Initialize local inference connection.
+ *
+ * The working local transport is the host akproxy (virtio-serial),
+ * initialized separately via ak_proxy_init(). This function snapshots
+ * proxy availability; the legacy direct virtio-serial device path is
+ * not implemented (no fd-level driver integration), so it never
+ * connects.
+ *
+ * Returns:
+ *   0                          - akproxy is connected
+ *   AK_E_LLM_NOT_CONFIGURED    - no config / no device path
+ *   AK_E_LLM_DEVICE_UNAVAILABLE - proxy down, legacy device unavailable
  */
 s64 ak_local_inference_init(ak_llm_local_config_t *config);
 
@@ -286,16 +307,27 @@ ak_local_inference_request(ak_inference_request_t *req);
 boolean ak_local_inference_healthy(void);
 
 /* ============================================================
- * EXTERNAL INFERENCE (HTTPS API)
+ * EXTERNAL INFERENCE (host proxy OR in-kernel HTTPS)
  * ============================================================ */
 
 /*
  * Initialize external API connection.
+ *
+ * Records configuration only. External providers are reachable via the
+ * host akproxy, or directly over real in-kernel HTTPS when the ak_https
+ * transport klib is loaded (see ak_transport.h).
  */
 s64 ak_external_inference_init(ak_llm_api_config_t *config);
 
 /*
  * Send request to external API.
+ *
+ * When the in-kernel HTTPS transport is registered (ak_transport_available()),
+ * this builds the provider-specific JSON body and headers (Authorization
+ * bearer / x-api-key from the configured secret), issues a real TLS POST to
+ * api.openai.com or api.anthropic.com via ak_https_request(), and parses the
+ * response. When NO transport is registered it fails closed with
+ * AK_E_LLM_CONNECTION_FAILED - it never fabricates a response.
  */
 ak_inference_response_t *
 ak_external_inference_request(ak_inference_request_t *req,
@@ -320,9 +352,16 @@ ak_parse_api_response(heap h, ak_llm_provider_t provider, buffer response);
 /*
  * Determine routing for model.
  *
+ * Because there is no in-kernel TLS/HTTP, requests that would go
+ * external are routed through the host proxy (LOCAL path) when it is
+ * connected. When the proxy is down, AK_LLM_EXTERNAL is returned so
+ * the caller receives the fail-closed error from
+ * ak_external_inference_request() - never a hang or fake success.
+ *
  * Returns:
- *   AK_LLM_LOCAL - Route to local inference
- *   AK_LLM_EXTERNAL - Route to external API
+ *   AK_LLM_LOCAL         - Route to local/proxy inference
+ *   AK_LLM_EXTERNAL      - Dead path; request will fail closed
+ *   AK_LLM_MODE_DISABLED - No backend configured
  */
 ak_llm_mode_t ak_inference_route(const char *model);
 

@@ -12,6 +12,23 @@
  *
  * SECURITY: This module implements INV-1 for network operations.
  * All network access MUST pass through these checks.
+ *
+ * SECURITY MODEL (see ak_net_enforce.c for full details):
+ *   - No network policy configured on the current context (no network
+ *     rules table and no AK_CAP_NET root capability - note the root
+ *     context is created lazily for every Nanos process): operations
+ *     are ALLOWED and the data plane is not filtered (single-tenant
+ *     unikernel; AK policy governs configured agent runs, not plain
+ *     workloads).
+ *   - Network policy configured: FAIL-CLOSED. connect/bind/accept/DNS
+ *     are allowed only via an explicit ALLOW rule or a matching
+ *     AK_CAP_NET root capability; otherwise denied with -EACCES.
+ *     Sends are budget-checked and DLP-scanned; receives are tracked.
+ *
+ * NOTE: These checks are invoked from src/net/netsyscall.c only when
+ * the kernel is built with CONFIG_AGENTIC defined (see the platform
+ * Makefiles). Without CONFIG_AGENTIC, socket-layer enforcement is
+ * compiled out.
  */
 
 #ifndef AK_NET_ENFORCE_H
@@ -59,7 +76,11 @@ s64 ak_net_check_connect(const char *host, u16 port, boolean is_ipv6);
  * @param port      Port to bind
  * @param is_ipv6   Whether this is IPv6
  *
- * @return 0 if allowed, negative error code if denied
+ * @return 0 if allowed, -EACCES if denied
+ *
+ * SECURITY: Fails-closed for agent contexts. The wildcard local
+ * address ("0.0.0.0" / "::") plus port must match an ALLOW rule or
+ * the root capability.
  */
 s64 ak_net_check_bind(u16 port, boolean is_ipv6);
 
@@ -68,10 +89,14 @@ s64 ak_net_check_bind(u16 port, boolean is_ipv6);
  *
  * Called from accept() syscall.
  *
- * @param client_host   Client IP address (null-terminated)
+ * @param client_host   Client IP address (null-terminated); NULL is
+ *                      treated as an unknown peer (only a "*" rule
+ *                      can admit it)
  * @param client_port   Client port
  *
- * @return 0 if allowed, negative error code if denied
+ * @return 0 if allowed, -EACCES if denied
+ *
+ * SECURITY: Fails-closed for agent contexts.
  */
 s64 ak_net_check_accept(const char *client_host, u16 client_port);
 

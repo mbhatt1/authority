@@ -33,6 +33,19 @@
 #define AK_MAX_DESCRIPTION_LEN 128
 #define AK_STATE_HASH_SIZE 32 /* SHA-256 */
 
+/*
+ * Checkpoint-ID returning functions (ak_checkpoint_create,
+ * ak_checkpoint_import, ak_state_prepare_migration) return:
+ *   > 0                 - valid checkpoint ID (IDs are small positive
+ *                         monotonic values, always < 2^63)
+ *   0                   - generic failure (not initialized, OOM, ...)
+ *   (u64)negative AK_E_ - specific failure, e.g.
+ *                         (u64)AK_E_TOO_MANY_CHECKPOINTS or
+ *                         (u64)AK_E_STATE_FROZEN
+ * Use this macro to test for success.
+ */
+#define AK_CHECKPOINT_ID_VALID(id) ((s64)(id) > 0)
+
 /* ============================================================
  * STATE CHECKPOINT
  * ============================================================
@@ -199,7 +212,10 @@ void ak_state_mgmt_shutdown(void);
  *   description - Human-readable description (may be NULL)
  *
  * Returns:
- *   Checkpoint ID on success, 0 on failure
+ *   Checkpoint ID (> 0) on success; 0 on generic failure;
+ *   (u64)AK_E_TOO_MANY_CHECKPOINTS when the per-agent checkpoint limit
+ *   is reached; (u64)AK_E_STATE_FROZEN while state is frozen for
+ *   migration. Test with AK_CHECKPOINT_ID_VALID().
  */
 u64 ak_checkpoint_create(ak_agent_context_t *ctx, const char *description);
 
@@ -489,7 +505,9 @@ void ak_state_keys_free(heap h, char **keys, u64 count);
  *   ctx - Agent context
  *
  * Returns:
- *   Migration checkpoint ID on success, 0 on failure
+ *   Migration checkpoint ID (> 0) on success; 0 or a (u64)negative
+ *   AK_E_ code on failure (see AK_CHECKPOINT_ID_VALID()). State is NOT
+ *   frozen on failure.
  */
 u64 ak_state_prepare_migration(ak_agent_context_t *ctx);
 

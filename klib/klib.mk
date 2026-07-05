@@ -3,6 +3,7 @@ KLIB_DIR= $(ROOTDIR)/klib
 MBEDTLS_DIR=	$(VENDORDIR)/mbedtls
 
 KLIBS= \
+	ak_https \
 	azure \
 	cloud_init \
 	cloudwatch \
@@ -20,6 +21,10 @@ KLIBS= \
 	tls \
 	tun \
 	userdata \
+
+SRCS-ak_https= \
+	$(KLIB_DIR)/ak_https.c \
+	$(KLIB_DIR)/net_utils.c \
 
 SRCS-azure= \
 	$(KLIB_DIR)/azure.c \

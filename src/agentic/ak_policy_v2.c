@@ -29,6 +29,26 @@ static struct {
   ak_policy_v2_t *current_policy;
 } ak_policy_v2_state;
 
+/*
+ * HMAC-SHA256 policy verification key (symmetric authentication, not an
+ * Ed25519 digital signature). When configured, ak_policy_v2_load()
+ * rejects unsigned/invalid policies (fail-closed).
+ */
+static struct {
+  u8 key[AK_KEY_SIZE];
+  boolean configured;
+} ak_policy_v2_verify_key;
+
+void ak_policy_v2_set_verification_key(const u8 *key) {
+  if (!key) {
+    runtime_memset(ak_policy_v2_verify_key.key, 0, AK_KEY_SIZE);
+    ak_policy_v2_verify_key.configured = false;
+    return;
+  }
+  runtime_memcpy(ak_policy_v2_verify_key.key, key, AK_KEY_SIZE);
+  ak_policy_v2_verify_key.configured = true;
+}
+
 /* ============================================================
  * BUILT-IN PROFILES (JSON)
  * ============================================================ */
@@ -141,6 +161,152 @@ static void compute_policy_hash(const u8 *json, u64 len, u8 *hash_out) {
     return;
 
   ak_sha256(json, (u32)len, hash_out);
+}
+
+/* ============================================================
+ * POLICY INTEGRITY (HMAC-SHA256)
+ * ============================================================
+ * Symmetric authentication of the policy document. NOT an Ed25519
+ * digital signature: any key holder can forge tags, so this protects
+ * against tampering by parties without the key only.
+ *
+ * Tag = HMAC-SHA256(key, SHA-256(document with "signature" value
+ * emptied)). The host signer builds the document with "signature":"",
+ * computes the tag over its hash, and inserts the hex tag in place.
+ */
+
+/* HMAC-SHA256 for short messages (data_len <= AK_HASH_SIZE) */
+static boolean v2_hmac_sha256(const u8 *key, u32 key_len, const u8 *data,
+                              u32 data_len, u8 *output) {
+  u8 key_block[64];
+  u8 pad_buf[64 + AK_HASH_SIZE];
+  u8 inner_hash[32];
+
+  if (data_len > AK_HASH_SIZE)
+    return false;
+
+  runtime_memset(key_block, 0, 64);
+  if (key_len > 64)
+    ak_sha256(key, key_len, key_block);
+  else
+    runtime_memcpy(key_block, key, key_len);
+
+  /* Inner hash: H((key ^ ipad) || message) */
+  for (int i = 0; i < 64; i++)
+    pad_buf[i] = key_block[i] ^ 0x36;
+  runtime_memcpy(pad_buf + 64, data, data_len);
+  ak_sha256(pad_buf, 64 + data_len, inner_hash);
+
+  /* Outer hash: H((key ^ opad) || inner_hash) */
+  for (int i = 0; i < 64; i++)
+    pad_buf[i] = key_block[i] ^ 0x5c;
+  runtime_memcpy(pad_buf + 64, inner_hash, 32);
+  ak_sha256(pad_buf, 64 + 32, output);
+
+  runtime_memset(key_block, 0, 64);
+  runtime_memset(pad_buf, 0, sizeof(pad_buf));
+  runtime_memset(inner_hash, 0, 32);
+  return true;
+}
+
+/* Constant-time comparison to prevent timing attacks */
+static boolean v2_constant_time_compare(const u8 *a, const u8 *b, u32 len) {
+  u8 diff = 0;
+  for (u32 i = 0; i < len; i++)
+    diff |= a[i] ^ b[i];
+  return diff == 0;
+}
+
+static int v2_hex_nibble(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+/* Decode exactly 2 * out_len hex chars into out */
+static boolean v2_parse_hex(const char *hex, u8 *out, u64 out_len) {
+  for (u64 i = 0; i < out_len; i++) {
+    int hi = v2_hex_nibble(hex[i * 2]);
+    int lo = v2_hex_nibble(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0)
+      return false;
+    out[i] = (u8)((hi << 4) | lo);
+  }
+  return true;
+}
+
+/*
+ * Locate the top-level "signature" string value in the raw document.
+ * On success, vstart/vend delimit the value characters (exclusive of
+ * the surrounding quotes).
+ */
+static boolean find_signature_value_span(const u8 *json, u64 len, u64 *vstart,
+                                         u64 *vend) {
+  static const char sig_key[] = "\"signature\"";
+  const u64 key_len = sizeof(sig_key) - 1;
+
+  for (u64 i = 0; i + key_len < len; i++) {
+    if (local_strncmp((const char *)&json[i], sig_key, key_len) != 0)
+      continue;
+
+    u64 j = i + key_len;
+    while (j < len && (json[j] == ' ' || json[j] == '\t' || json[j] == '\n' ||
+                       json[j] == '\r'))
+      j++;
+    if (j >= len || json[j] != ':')
+      continue;
+    j++;
+    while (j < len && (json[j] == ' ' || json[j] == '\t' || json[j] == '\n' ||
+                       json[j] == '\r'))
+      j++;
+    if (j >= len || json[j] != '"')
+      continue;
+    j++;
+
+    u64 start = j;
+    while (j < len && json[j] != '"') {
+      if (json[j] == '\\' && j + 1 < len)
+        j++;
+      j++;
+    }
+    if (j >= len)
+      return false; /* Unterminated value */
+
+    *vstart = start;
+    *vend = j;
+    return true;
+  }
+  return false;
+}
+
+/*
+ * Compute the signed-content hash: SHA-256 of the document with the
+ * "signature" value emptied. If no signature member exists, the whole
+ * document is hashed.
+ */
+static boolean compute_signed_content_hash(heap h, const u8 *json, u64 len,
+                                           u8 *hash_out) {
+  u64 vstart, vend;
+
+  if (!find_signature_value_span(json, len, &vstart, &vend)) {
+    compute_policy_hash(json, len, hash_out);
+    return true;
+  }
+
+  u8 *scratch = allocate(h, len);
+  if (!scratch)
+    return false;
+
+  runtime_memcpy(scratch, json, vstart);
+  runtime_memcpy(scratch + vstart, json + vend, len - vend);
+  compute_policy_hash(scratch, len - (vend - vstart), hash_out);
+
+  deallocate(h, scratch, len);
+  return true;
 }
 
 /* ============================================================
@@ -658,6 +824,22 @@ static boolean parse_json_policy(ak_policy_v2_t *policy, const u8 *json,
       p = parse_string(p, end, policy->version, sizeof(policy->version));
       if (!p)
         return false;
+    } else if (local_strcmp(key, "signature") == 0) {
+      /* HMAC-SHA256 tag: exactly 64 hex chars (32-byte MAC).
+       * Symmetric authentication, not an Ed25519 signature. */
+      char sighex[2 * AK_MAC_SIZE + 2];
+      p = parse_string(p, end, sighex, sizeof(sighex));
+      if (!p)
+        return false;
+      u64 hexlen = local_strlen(sighex);
+      if (hexlen == 2 * AK_MAC_SIZE &&
+          v2_parse_hex(sighex, policy->signature, AK_MAC_SIZE)) {
+        policy->has_signature = true;
+      } else if (hexlen != 0) {
+        rprintf("[AK] Policy signature malformed (expected %d hex chars)\n",
+                2 * AK_MAC_SIZE);
+        return false; /* Malformed signature - reject (fail-closed) */
+      }
     } else if (local_strcmp(key, "fs") == 0) {
       /* Parse fs object: { "read": [...], "write": [...] } */
       if (*p != '{') {
@@ -851,7 +1033,6 @@ static boolean parse_json_policy(ak_policy_v2_t *policy, const u8 *json,
           break;
 
         char infer_key[32];
-        const u8 *key_start = p;
         p = parse_string(p, end, infer_key, sizeof(infer_key));
         if (!p)
           return false;
@@ -1162,8 +1343,41 @@ ak_policy_v2_t *ak_policy_v2_load(heap h, const u8 *json, u64 len) {
     return NULL;
   }
 
-  /* Compute hash */
+  /* Compute hash (identifies the full raw document) */
   compute_policy_hash(json, len, policy->policy_hash);
+
+  /*
+   * Integrity check (HMAC-SHA256, symmetric - not an Ed25519 signature):
+   *   - Key configured: unsigned or wrongly-tagged policies are REJECTED.
+   *   - No key configured: policy is accepted but explicitly flagged
+   *     unsigned; it is never treated as verified.
+   */
+  if (ak_policy_v2_verify_key.configured) {
+    u8 signed_hash[AK_HASH_SIZE];
+    u8 mac[AK_MAC_SIZE];
+    boolean ok = policy->has_signature &&
+                 compute_signed_content_hash(h, json, len, signed_hash) &&
+                 v2_hmac_sha256(ak_policy_v2_verify_key.key, AK_KEY_SIZE,
+                                signed_hash, AK_HASH_SIZE, mac) &&
+                 v2_constant_time_compare(mac, policy->signature, AK_MAC_SIZE);
+    if (!ok) {
+      rprintf("[AK] SECURITY: policy rejected: %s (verification key "
+              "configured)\n",
+              policy->has_signature ? "HMAC verification failed"
+                                    : "unsigned policy");
+      ak_policy_v2_destroy(policy);
+      return NULL;
+    }
+    policy->signature_verified = true;
+  } else {
+    policy->signature_verified = false;
+    if (!policy->has_signature)
+      rprintf("[AK] SECURITY WARNING: policy loaded UNSIGNED (no "
+              "verification key configured); integrity is NOT guaranteed\n");
+    else
+      rprintf("[AK] SECURITY WARNING: policy carries an HMAC tag but no "
+              "verification key is configured; treating as UNVERIFIED\n");
+  }
 
   /* Expand included profiles */
   for (u32 i = 0; i < policy->profile_count; i++) {
@@ -1655,6 +1869,64 @@ static void extract_target_info(const ak_effect_req_t *req, char *info,
   local_strncpy(info, req->target, max_len);
 }
 
+/*
+ * Open flag constants (Linux ABI, matching src/unix/system_structs.h;
+ * defined locally because the unix headers are not visible here).
+ */
+#ifndef O_RDONLY
+#define O_RDONLY 00000000
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY 00000001
+#endif
+#ifndef O_RDWR
+#define O_RDWR 00000002
+#endif
+#ifndef O_ACCMODE
+#define O_ACCMODE 00000003
+#endif
+#ifndef O_CREAT
+#define O_CREAT 00000100
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC 00001000
+#endif
+#ifndef O_APPEND
+#define O_APPEND 00002000
+#endif
+
+/*
+ * Extract a numeric member (e.g. "f") from the minimal params JSON
+ * emitted by ak_effect_from_open(): {"f":<flags>,"m":<mode>}.
+ * Returns true and stores the value on success.
+ */
+static boolean parse_params_u64(const u8 *params, u32 params_len,
+                                const char *key, u64 *out) {
+  if (!params || params_len == 0 || !key || !out)
+    return false;
+
+  u64 key_len = local_strlen(key);
+
+  for (u64 i = 0; i + key_len + 2 < params_len; i++) {
+    if (params[i] != '"' ||
+        local_strncmp((const char *)&params[i + 1], key, key_len) != 0 ||
+        params[i + 1 + key_len] != '"')
+      continue;
+
+    u64 j = i + 1 + key_len + 1;
+    while (j < params_len &&
+           (params[j] == ':' || params[j] == ' ' || params[j] == '\t'))
+      j++;
+    if (j >= params_len || params[j] < '0' || params[j] > '9')
+      return false;
+
+    const u8 *end_num =
+        parse_number(&params[j], params + params_len, out);
+    return (end_num != NULL);
+  }
+  return false;
+}
+
 boolean ak_policy_v2_check(ak_policy_v2_t *policy, const ak_effect_req_t *req,
                            ak_decision_t *decision_out) {
   if (!decision_out)
@@ -1703,16 +1975,30 @@ boolean ak_policy_v2_check(ak_policy_v2_t *policy, const ak_effect_req_t *req,
   /* Check based on effect type */
   switch (req->op) {
   case AK_E_FS_OPEN: {
-    /* Determine if read or write from params or flags */
-    boolean write = false;
-    /* For simplicity, check both - if write rules exist and match, it's write
+    /*
+     * Determine access intent from the open flags encoded in
+     * req->params by ak_effect_from_open(): {"f":<flags>,"m":<mode>}.
+     * Write-intent opens (O_WRONLY/O_RDWR access mode, or
+     * O_CREAT/O_TRUNC/O_APPEND) require WRITE scope. If the flags
+     * cannot be determined, require BOTH scopes (fail-closed).
      */
-    if (ak_policy_v2_check_fs(policy, req->target, true)) {
-      allowed = true;
-    } else if (ak_policy_v2_check_fs(policy, req->target, false)) {
-      allowed = true;
+    u64 flags = 0;
+    boolean need_read = true;
+    boolean need_write = true;
+    if (parse_params_u64(req->params, req->params_len, "f", &flags)) {
+      u64 acc = flags & O_ACCMODE;
+      need_read = (acc != O_WRONLY);
+      need_write = (acc != O_RDONLY) ||
+                   (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     }
-    missing_cap = write ? "fs.write" : "fs.read";
+
+    allowed = true;
+    if (need_read && !ak_policy_v2_check_fs(policy, req->target, false))
+      allowed = false;
+    if (allowed && need_write &&
+        !ak_policy_v2_check_fs(policy, req->target, true))
+      allowed = false;
+    missing_cap = need_write ? "fs.write" : "fs.read";
     break;
   }
 

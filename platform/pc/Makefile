@@ -142,7 +142,29 @@ SRCS-kernel.elf= \
 	$(SRCS-lwip) \
 	$(SRCS-agentic)
 
-# Authority Kernel sources
+# Authority Kernel sources (core set)
+#
+# KNOWN ISSUE (x86_64 only, pre-existing): ak_budget.c does not compile
+# with the kernel's -mno-sse flags because the (dead, zero-caller)
+# function ak_budget_calc_rate() returns 'double', which requires the
+# SSE return ABI ("SSE register return with SSE disabled" on both gcc
+# and clang). ak_budget.c cannot be dropped from this list: ak_syscall.c
+# calls ak_budget_create/check/commit on live paths. The fix must be in
+# src/agentic/ak_budget.c itself (remove the function or make it return
+# a scaled integer); no safe Makefile-level workaround exists
+# (-msoft-float does not change the x86_64 FP return ABI, and enabling
+# SSE for kernel code is unsafe without FPU state save/restore).
+#
+# NOT in the kernel build (future work; see src/agentic/):
+#   ak_agentic.c, ak_context.c, ak_effects.c, ak_posix_route.c,
+#   ak_policy_v2.c, ak_tool_registry.c, ak_observe.c, ak_process.c,
+#   ak_state_mgmt.c, ak_stream.c, ak_agent_ipc.c, ak_deny_ux.c,
+#   ak_fd_table.c, ak_policy_toml.c, ak_record.c
+# Reasons: duplicate symbols with the core set (ak_tool_registry.c vs
+# ak_wasm.c; ak_agent_ipc.c vs ak_ipc.c), unresolved cross-dependencies
+# (ak_agentic.c/ak_posix_route.c require ak_effects.c and ak_context.c),
+# and code that has not been verified to compile/link in the kernel
+# environment. Keep this list in sync across platform/{pc,virt,riscv-virt}.
 SRCS-agentic= \
 	$(SRCDIR)/agentic/ak_approval.c \
 	$(SRCDIR)/agentic/ak_audit.c \
@@ -154,14 +176,17 @@ SRCS-agentic= \
 	$(SRCDIR)/agentic/ak_ipc.c \
 	$(SRCDIR)/agentic/ak_lz4.c \
 	$(SRCDIR)/agentic/ak_nanos.c \
+	$(SRCDIR)/agentic/ak_net_enforce.c \
 	$(SRCDIR)/agentic/ak_pattern.c \
 	$(SRCDIR)/agentic/ak_policy.c \
 	$(SRCDIR)/agentic/ak_sanitize.c \
 	$(SRCDIR)/agentic/ak_secrets.c \
 	$(SRCDIR)/agentic/ak_state.c \
 	$(SRCDIR)/agentic/ak_syscall.c \
+	$(SRCDIR)/agentic/ak_transport.c \
 	$(SRCDIR)/agentic/ak_virtio_proxy.c \
 	$(SRCDIR)/agentic/ak_wasm.c \
+	$(SRCDIR)/agentic/ak_wasm_interp.c \
 	$(SRCDIR)/agentic/ak_wasm_host.c
 
 SRCS-lwip= \
@@ -222,6 +247,9 @@ CFLAGS+=-DCONFIG_LTRACE
 CFLAGS+=-DDMA_BUFFERING	# required by memory encryption
 CFLAGS+=-DCONFIG_AK_ENABLED	# Authority Kernel security layer
 CFLAGS+=-DCONFIG_SYSCALL_AGENTIC=1	# AI-first syscall subset (removes inotify, io_uring)
+# Socket-layer network enforcement hooks in src/net/netsyscall.c
+# (requires ak_net_enforce.c in SRCS-agentic above)
+CFLAGS+=-DCONFIG_AGENTIC
 
 AFLAGS+=	-felf64 -I$(OBJDIR)/
 

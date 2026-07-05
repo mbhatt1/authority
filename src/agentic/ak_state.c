@@ -10,15 +10,16 @@
  *   - On shutdown: Final sync + anchor emission
  *
  * Supported backends:
- *   - S3-compatible object storage
- *   - Redis/Valkey key-value store
- *   - Custom HTTP endpoints
- *   - virtio-serial to host storage daemon
+ *   - virtio-serial to host storage daemon (the only functional backend)
+ *   - S3/Redis/HTTP are defined in the API but fail closed (no TLS/TCP
+ *     client in the kernel)
  *
  * Security:
- *   - All state encrypted at rest (AES-256-GCM)
- *   - Integrity verified via merkle proofs
- *   - Anchors provide tamper-evident chain
+ *   - Object integrity verified via per-object hashes and merkle roots
+ *   - Anchors provide a tamper-evident hash chain (unsigned: no
+ *     non-repudiation)
+ *   - Encryption at rest is NOT implemented in-kernel; delegate to the
+ *     host daemon / backing store if required
  *
  * REMOTE ANCHOR POSTING (P2-3 Documentation):
  * ============================================
@@ -30,9 +31,10 @@
  * To use remote backends, deployments must use one of:
  *
  *   1. VIRTIO Backend (Recommended for cloud):
- *      - Use AK_STORAGE_VIRTIO with a host-side storage daemon
+ *      - Use AK_STORAGE_VIRTIO with the host-side akproxy daemon
  *      - The daemon handles HTTPS/TLS and forwards to S3/Redis/HTTP
- *      - Protocol: [cmd:1][ptr:8][len:4][data] over virtio-serial
+ *      - Implemented via ak_virtio_proxy filesystem operations
+ *        (one file per object; see BACKEND OPERATIONS below)
  *      - Provides isolation: kernel never sees credentials
  *
  *   2. Sidecar Proxy (Alternative):
@@ -67,6 +69,7 @@
 #include "ak_compress.h"
 #include "ak_heap.h"
 #include "ak_syscall.h"
+#include "ak_virtio_proxy.h"
 
 /* ============================================================
  * INTERNAL STATE
@@ -74,6 +77,11 @@
 
 #define AK_MAX_DIRTY_OBJECTS 65536
 #define AK_DIRTY_BITMAP_SIZE (AK_MAX_DIRTY_OBJECTS / 64)
+
+/* Key tag distinguishing anchor records from heap objects in the
+ * backend keyspace (see ak_state_emit_anchor / ak_backend_list) */
+#define AK_ANCHOR_KEY_TAG 0x00A0C40000000000ULL
+#define AK_ANCHOR_KEY_MASK 0xFFFFFF0000000000ULL
 
 static struct {
   heap h;
@@ -470,7 +478,9 @@ ak_sync_result_t ak_state_sync(void) {
   }
 
   if (ak_state.config.backend == AK_STORAGE_NONE) {
-    result.status = AK_SYNC_COMPLETED;
+    /* No backend configured: nothing was (or can be) durably persisted.
+     * Do NOT report AK_SYNC_COMPLETED, which callers read as "durable". */
+    result.status = AK_SYNC_NO_BACKEND;
     return result;
   }
 
@@ -497,53 +507,55 @@ ak_sync_result_t ak_state_sync_objects(u64 *ptrs, u32 count) {
   u64 start_ms = get_timestamp_ms();
   u64 objects_synced = 0;
   u64 bytes_synced = 0;
+  s64 last_error = 0;
+
+  /* Copy the ptr list: callers typically pass ak_state.dirty_ptrs, which
+   * ak_state_mark_clean() mutates by shifting elements. Iterating the
+   * live array would skip objects after each successful put. */
+  u64 *ptrs_copy = allocate(ak_state.h, (u64)count * sizeof(u64));
+  if (ptrs_copy == INVALID_ADDRESS) {
+    result.status = AK_SYNC_FAILED;
+    result.error_code = AK_E_STATE_SYNC_FAILED;
+    ak_state.stats.syncs_failed++;
+    ak_state.sync_status = AK_SYNC_FAILED;
+    return result;
+  }
+  runtime_memcpy(ptrs_copy, ptrs, (u64)count * sizeof(u64));
 
   /* Sync each object */
   for (u32 i = 0; i < count; i++) {
-    u64 ptr = ptrs[i];
+    u64 ptr = ptrs_copy[i];
 
     /* Get object value from typed heap */
     buffer value = ak_heap_serialize_object(ak_state.h, ptr);
-    if (!value || value == INVALID_ADDRESS)
+    if (!value || value == INVALID_ADDRESS) {
+      last_error = AK_E_STATE_SYNC_FAILED;
       continue;
+    }
 
-    /* Compute hash for integrity (on uncompressed data) */
+    /* Compute hash for integrity (on uncompressed data). Compression,
+     * where supported, is handled inside the backend so that the stored
+     * record carries the metadata needed to restore the object. */
     u8 hash[AK_HASH_SIZE];
     compute_hash(value, hash);
 
-    /* Compress if worthwhile */
-    buffer to_store = value;
-    boolean compressed = false;
-    if (ak_state.config.compression_enabled &&
-        ak_compress_worthwhile(buffer_length(value))) {
-      buffer compressed_value = ak_compress_lz4(ak_state.h, value);
-      if (compressed_value && compressed_value != INVALID_ADDRESS) {
-        /* Only use compressed if it's actually smaller */
-        if (buffer_length(compressed_value) < buffer_length(value)) {
-          to_store = compressed_value;
-          compressed = true;
-        } else {
-          deallocate_buffer(compressed_value);
-        }
-      }
-    }
-
     /* Store to backend */
-    s64 put_result = ak_backend_put(ptr, to_store, hash);
+    s64 put_result = ak_backend_put(ptr, value, hash);
 
     if (put_result == 0) {
+      /* Only objects actually acknowledged by the backend are marked
+       * clean; failed objects stay dirty for the next sync attempt. */
       objects_synced++;
-      bytes_synced += buffer_length(to_store);
+      bytes_synced += buffer_length(value);
       ak_state_mark_clean(ptr);
-      if (compressed)
-        ak_state.stats.bytes_compressed +=
-            buffer_length(value) - buffer_length(to_store);
+    } else {
+      last_error = put_result;
     }
 
-    if (compressed)
-      deallocate_buffer(to_store);
     deallocate_buffer(value);
   }
+
+  deallocate(ak_state.h, ptrs_copy, (u64)count * sizeof(u64));
 
   result.duration_ms = get_timestamp_ms() - start_ms;
   result.objects_synced = objects_synced;
@@ -554,9 +566,10 @@ ak_sync_result_t ak_state_sync_objects(u64 *ptrs, u32 count) {
     ak_state.stats.syncs_successful++;
   } else if (objects_synced > 0) {
     result.status = AK_SYNC_PARTIAL;
+    result.error_code = last_error ? last_error : AK_E_STATE_SYNC_FAILED;
   } else {
     result.status = AK_SYNC_FAILED;
-    result.error_code = AK_E_STATE_SYNC_FAILED;
+    result.error_code = last_error ? last_error : AK_E_STATE_SYNC_FAILED;
     ak_state.stats.syncs_failed++;
   }
 
@@ -599,7 +612,13 @@ s64 ak_state_emit_anchor(void) {
   runtime_memcpy(anchor.prev_anchor, ak_state.latest_anchor.heap_root,
                  AK_HASH_SIZE);
 
-  /* Compute merkle root of heap state */
+  /* Compute merkle root over the DIRTY object set at emission time.
+   *
+   * HONESTY NOTE: this is a delta commitment, not a commitment to the
+   * full heap - the kernel has no full-heap enumeration API. After a
+   * fully clean sync the dirty set is empty and heap_root is all zeros.
+   * Tamper-evidence for history comes from the prev_anchor chain and
+   * log_root (audit log head), not from heap_root alone. */
   u32 count;
   u64 *ptrs = ak_state_get_dirty_list(&count);
 
@@ -626,19 +645,23 @@ s64 ak_state_emit_anchor(void) {
   /* Get latest audit log hash */
   ak_audit_head_hash(anchor.log_root);
 
-  /* Anchor signature (optional): When CONFIG_AK_SIGNED_ANCHORS is enabled,
-   * an Ed25519 signature would be computed here using the kernel's signing key.
-   * Without signatures, anchors provide tamper-evidence through hash chains
-   * but not non-repudiation. Signature verification at load time is controlled
-   * by the ak_state_config.verify_signatures flag. */
+  /* The signature field is left all zeros: Ed25519 anchor signing is NOT
+   * implemented. Anchors provide tamper-evidence through the prev_anchor
+   * hash chain and log_root, but no non-repudiation. */
 
-  /* Store anchor to backend */
+  /* Store anchor to backend (best effort; the local chain is authoritative) */
   if (ak_state.config.backend != AK_STORAGE_NONE) {
     buffer anchor_buf = allocate_buffer(ak_state.h, sizeof(ak_state_anchor_t));
     if (anchor_buf != INVALID_ADDRESS) {
       buffer_write(anchor_buf, &anchor, sizeof(ak_state_anchor_t));
-      ak_backend_put(anchor.sequence | 0xA0C40000000000ULL, anchor_buf,
-                     anchor.heap_root);
+      /* Integrity hash must cover the stored record itself */
+      u8 anchor_hash[AK_HASH_SIZE];
+      compute_hash(anchor_buf, anchor_hash);
+      s64 put_res = ak_backend_put(AK_ANCHOR_KEY_TAG | anchor.sequence,
+                                   anchor_buf, anchor_hash);
+      if (put_res != 0)
+        ak_warn("ak_state: anchor %llu not stored to backend (err %lld)",
+                anchor.sequence, put_res);
       deallocate_buffer(anchor_buf);
     }
   }
@@ -676,32 +699,122 @@ boolean ak_state_verify_anchor_chain(void) {
 /* ============================================================
  * BACKEND OPERATIONS
  *
- * Protocol for virtio backend:
- *   Request:  [1 byte cmd][8 bytes ptr][4 bytes len][data]
- *   Response: [1 byte status][4 bytes len][data]
+ * VIRTIO backend (the only functional backend):
+ * ----------------------------------------------
+ * Objects are persisted through the host-side akproxy daemon using the
+ * ak_virtio_proxy filesystem operations. Each object is stored as a
+ * file AK_VIRTIO_STATE_DIR/obj_<ptr:16 hex> whose content is the hex
+ * encoding of the record:
  *
- * Commands: 0x01=PUT, 0x02=GET, 0x03=DELETE, 0x04=LIST
+ *   [flags:1][hash:32][payload]
+ *
+ *   flags bit 0 - payload is LZ4 compressed (ak_compress_lz4 framing)
+ *   hash        - integrity hash of the payload exactly as stored
+ *
+ * Hex encoding is used because the proxy fs_read path returns JSON
+ * string content without unescaping; hex needs no escaping and
+ * round-trips losslessly. Deletion writes a zero-length tombstone file
+ * (the proxy exposes no remove operation); ak_backend_get() treats
+ * tombstones as not-found.
  *
  * NETWORK BACKEND LIMITATIONS (P2-3):
  * -----------------------------------
  * S3, Redis, and HTTP backends require HTTPS/TLS which is not
- * available in the kernel. These backends return AK_E_STATE_BACKEND_ERROR.
- *
- * To implement remote storage, use the VIRTIO backend with a host-side
- * daemon that performs the actual HTTPS operations. See file header
- * documentation for deployment options.
+ * available in the kernel. These backends FAIL CLOSED: puts/deletes
+ * return AK_E_STATE_BACKEND_ERROR and get/list return empty, so no
+ * caller can mistake them for successful persistence. To use remote
+ * storage, use the VIRTIO backend with a host-side daemon that
+ * performs the actual HTTPS operations.
  * ============================================================ */
 
-#define VIRTIO_CMD_PUT 0x01
-#define VIRTIO_CMD_GET 0x02
-#define VIRTIO_CMD_DELETE 0x03
-#define VIRTIO_CMD_LIST 0x04
+#define AK_VIRTIO_STATE_DIR "/ak/state"
+#define AK_VIRTIO_REC_COMPRESSED (1 << 0)
+/* "/ak/state/obj_" + 16 hex digits + NUL */
+#define AK_VIRTIO_PATH_MAX 80
+
+static const char ak_hex_digits[] = "0123456789abcdef";
+
+static void hex_encode(buffer out, const u8 *data, u64 len) {
+  for (u64 i = 0; i < len; i++) {
+    char pair[2];
+    pair[0] = ak_hex_digits[data[i] >> 4];
+    pair[1] = ak_hex_digits[data[i] & 0xf];
+    buffer_write(out, pair, 2);
+  }
+}
+
+static int hex_nibble(u8 c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+/* Decode hex_len (even) hex chars into hex_len / 2 bytes */
+static boolean hex_decode(const u8 *hex, u64 hex_len, u8 *out) {
+  for (u64 i = 0; i + 1 < hex_len; i += 2) {
+    int hi = hex_nibble(hex[i]);
+    int lo = hex_nibble(hex[i + 1]);
+    if (hi < 0 || lo < 0)
+      return false;
+    out[i / 2] = (u8)((hi << 4) | lo);
+  }
+  return true;
+}
+
+/* Build AK_VIRTIO_STATE_DIR "/obj_<16 hex>" into path (>= AK_VIRTIO_PATH_MAX
+ * bytes) */
+static void virtio_object_path(u64 ptr, char *path) {
+  const char *prefix = AK_VIRTIO_STATE_DIR "/obj_";
+  u64 plen = runtime_strlen(prefix);
+  runtime_memcpy(path, prefix, plen);
+  u64 v = ptr;
+  for (int i = 15; i >= 0; i--) {
+    path[plen + i] = ak_hex_digits[v & 0xf];
+    v >>= 4;
+  }
+  path[plen + 16] = '\0';
+}
+
+/* Parse an "obj_<16 hex>" directory entry back to an object ptr.
+ * Returns false for directories, foreign files and anchor records. */
+static boolean virtio_entry_to_ptr(ak_file_info_t *info, u64 *ptr_out) {
+  if (info->is_dir)
+    return false;
+  if (runtime_strncmp(info->name, "obj_", 4) != 0)
+    return false;
+
+  u64 v = 0;
+  for (int i = 0; i < 16; i++) {
+    int nib = hex_nibble((u8)info->name[4 + i]);
+    if (nib < 0)
+      return false;
+    v = (v << 4) | (u64)nib;
+  }
+  if (info->name[20] != '\0')
+    return false;
+
+  /* Anchor records are not heap objects */
+  if ((v & AK_ANCHOR_KEY_MASK) == AK_ANCHOR_KEY_TAG)
+    return false;
+
+  *ptr_out = v;
+  return true;
+}
 
 /*
  * Store an object to the backend.
  *
- * NOTE: S3/Redis/HTTP backends are not implemented (require HTTPS client).
- * Use VIRTIO backend with host-side daemon for remote storage.
+ * VIRTIO: persisted via the host-side akproxy daemon; returns 0 only if
+ * the daemon acknowledged the write. Compression (when enabled and
+ * worthwhile) is applied here so the stored record carries the
+ * compressed flag needed for restore.
+ *
+ * S3/Redis/HTTP: fail closed (require HTTPS client not present in
+ * kernel).
  */
 s64 ak_backend_put(u64 ptr, buffer value, u8 *hash) {
   if (!ak_state.initialized || ak_state.config.backend == AK_STORAGE_NONE)
@@ -723,13 +836,59 @@ s64 ak_backend_put(u64 ptr, buffer value, u8 *hash) {
     /* HTTP POST requires HTTPS client - not implemented in kernel */
     return AK_E_STATE_BACKEND_ERROR;
 
-  case AK_STORAGE_VIRTIO:
-    if (ak_state.virtio_fd < 0)
+  case AK_STORAGE_VIRTIO: {
+    if (!ak_proxy_connected())
       return AK_E_STATE_BACKEND_ERROR;
 
-    /* Protocol: [cmd:1][ptr:8][len:4][hash:32][data:len] */
-    /* Would write to virtio_fd here */
-    return AK_E_STATE_BACKEND_ERROR;
+    /* Optionally compress the payload */
+    buffer to_store = value;
+    boolean compressed = false;
+    if (ak_state.config.compression_enabled &&
+        ak_compress_worthwhile(buffer_length(value))) {
+      buffer compressed_value = ak_compress_lz4(ak_state.h, value);
+      if (compressed_value && compressed_value != INVALID_ADDRESS) {
+        if (buffer_length(compressed_value) < buffer_length(value)) {
+          to_store = compressed_value;
+          compressed = true;
+        } else {
+          deallocate_buffer(compressed_value);
+        }
+      }
+    }
+
+    /* Integrity hash covers the payload exactly as stored (the caller's
+     * hash covers the uncompressed value and cannot be verified against
+     * a compressed record) */
+    u8 rec_hash[AK_HASH_SIZE];
+    compute_hash(to_store, rec_hash);
+
+    u8 flags = compressed ? AK_VIRTIO_REC_COMPRESSED : 0;
+    buffer content = allocate_buffer(
+        ak_state.h, 2 * (1 + AK_HASH_SIZE + buffer_length(to_store)));
+    if (!content || content == INVALID_ADDRESS) {
+      if (compressed)
+        deallocate_buffer(to_store);
+      return AK_E_STATE_BACKEND_ERROR;
+    }
+    hex_encode(content, &flags, 1);
+    hex_encode(content, rec_hash, AK_HASH_SIZE);
+    hex_encode(content, buffer_ref(to_store, 0), buffer_length(to_store));
+
+    char path[AK_VIRTIO_PATH_MAX];
+    virtio_object_path(ptr, path);
+
+    s64 wres = ak_proxy_fs_write(path, content);
+
+    if (compressed) {
+      if (wres >= 0)
+        ak_state.stats.bytes_compressed +=
+            buffer_length(value) - buffer_length(to_store);
+      deallocate_buffer(to_store);
+    }
+    deallocate_buffer(content);
+
+    return (wres < 0) ? AK_E_STATE_BACKEND_ERROR : 0;
+  }
 
   default:
     return AK_E_STATE_BACKEND_ERROR;
@@ -744,16 +903,78 @@ buffer ak_backend_get(u64 ptr) {
   case AK_STORAGE_S3:
   case AK_STORAGE_REDIS:
   case AK_STORAGE_HTTP:
-    /* Network backends not implemented in kernel */
+    /* Network backends not implemented in kernel - fail closed */
     return 0;
 
-  case AK_STORAGE_VIRTIO:
-    if (ak_state.virtio_fd < 0)
+  case AK_STORAGE_VIRTIO: {
+    if (!ak_proxy_connected())
       return 0;
 
-    /* Protocol: [cmd:1][ptr:8] -> [status:1][len:4][data:len] */
-    /* Would read from virtio_fd here */
-    return 0;
+    char path[AK_VIRTIO_PATH_MAX];
+    virtio_object_path(ptr, path);
+
+    buffer content = 0;
+    s64 rres = ak_proxy_fs_read(path, &content);
+    if (rres < 0 || !content)
+      return 0;
+
+    u64 hex_len = buffer_length(content);
+    /* Zero length = tombstone; undersized or odd length = corrupt.
+     * Either way: not found (fail closed). */
+    if ((hex_len & 1) || hex_len < 2 * (1 + AK_HASH_SIZE)) {
+      deallocate_buffer(content);
+      return 0;
+    }
+
+    u64 rec_len = hex_len / 2;
+    u8 *rec = allocate(ak_state.h, rec_len);
+    if (rec == INVALID_ADDRESS) {
+      deallocate_buffer(content);
+      return 0;
+    }
+
+    boolean decoded = hex_decode(buffer_ref(content, 0), hex_len, rec);
+    deallocate_buffer(content);
+    if (!decoded) {
+      ak_warn("ak_state: corrupt record encoding for object %llu", ptr);
+      deallocate(ak_state.h, rec, rec_len);
+      return 0;
+    }
+
+    u8 flags = rec[0];
+    u8 *payload = rec + 1 + AK_HASH_SIZE;
+    u64 payload_len = rec_len - 1 - AK_HASH_SIZE;
+
+    /* Verify integrity hash over the payload as stored */
+    u8 computed[AK_HASH_SIZE];
+    buffer payload_wrap = alloca_wrap_buffer(payload, payload_len);
+    compute_hash(payload_wrap, computed);
+    if (runtime_memcmp(computed, rec + 1, AK_HASH_SIZE) != 0) {
+      ak_warn("ak_state: integrity hash mismatch for object %llu", ptr);
+      deallocate(ak_state.h, rec, rec_len);
+      return 0;
+    }
+
+    buffer result = allocate_buffer(ak_state.h, payload_len ? payload_len : 1);
+    if (!result || result == INVALID_ADDRESS) {
+      deallocate(ak_state.h, rec, rec_len);
+      return 0;
+    }
+    buffer_write(result, payload, payload_len);
+    deallocate(ak_state.h, rec, rec_len);
+
+    if (flags & AK_VIRTIO_REC_COMPRESSED) {
+      buffer decompressed = ak_decompress_lz4(ak_state.h, result);
+      deallocate_buffer(result);
+      if (!decompressed || decompressed == INVALID_ADDRESS) {
+        ak_warn("ak_state: decompression failed for object %llu", ptr);
+        return 0;
+      }
+      return decompressed;
+    }
+
+    return result;
+  }
 
   default:
     return 0;
@@ -770,10 +991,24 @@ s64 ak_backend_delete(u64 ptr) {
   case AK_STORAGE_HTTP:
     return AK_E_STATE_BACKEND_ERROR;
 
-  case AK_STORAGE_VIRTIO:
-    if (ak_state.virtio_fd < 0)
+  case AK_STORAGE_VIRTIO: {
+    if (!ak_proxy_connected())
       return AK_E_STATE_BACKEND_ERROR;
-    return AK_E_STATE_BACKEND_ERROR;
+
+    /* The proxy exposes no remove operation; write a zero-length
+     * tombstone. ak_backend_get() treats it as not-found. */
+    char path[AK_VIRTIO_PATH_MAX];
+    virtio_object_path(ptr, path);
+
+    buffer empty = allocate_buffer(ak_state.h, 1);
+    if (!empty || empty == INVALID_ADDRESS)
+      return AK_E_STATE_BACKEND_ERROR;
+
+    s64 wres = ak_proxy_fs_write(path, empty);
+    deallocate_buffer(empty);
+
+    return (wres < 0) ? AK_E_STATE_BACKEND_ERROR : 0;
+  }
 
   default:
     return AK_E_STATE_BACKEND_ERROR;
@@ -793,10 +1028,54 @@ u64 *ak_backend_list(u32 *count_out) {
   case AK_STORAGE_HTTP:
     return 0;
 
-  case AK_STORAGE_VIRTIO:
-    if (ak_state.virtio_fd < 0)
+  case AK_STORAGE_VIRTIO: {
+    if (!ak_proxy_connected())
       return 0;
-    return 0;
+
+    ak_file_info_t *entries = 0;
+    u64 entry_count = 0;
+    s64 lres = ak_proxy_fs_list(AK_VIRTIO_STATE_DIR, &entries, &entry_count);
+    if (lres < 0 || !entries || entry_count == 0) {
+      if (entries && entry_count)
+        deallocate(ak_state.h, entries,
+                   entry_count * sizeof(ak_file_info_t));
+      return 0;
+    }
+
+    /* First pass: count valid object entries so the returned array is
+     * allocated with exactly the size callers will deallocate. Capped
+     * at AK_MAX_DIRTY_OBJECTS to bound hydration memory usage. */
+    u32 valid = 0;
+    for (u64 i = 0; i < entry_count && valid < AK_MAX_DIRTY_OBJECTS; i++) {
+      u64 obj_ptr;
+      if (virtio_entry_to_ptr(&entries[i], &obj_ptr))
+        valid++;
+    }
+
+    if (valid == 0) {
+      deallocate(ak_state.h, entries, entry_count * sizeof(ak_file_info_t));
+      return 0;
+    }
+
+    u64 *ptrs = allocate(ak_state.h, (u64)valid * sizeof(u64));
+    if (ptrs == INVALID_ADDRESS) {
+      deallocate(ak_state.h, entries, entry_count * sizeof(ak_file_info_t));
+      return 0;
+    }
+
+    u32 idx = 0;
+    for (u64 i = 0; i < entry_count && idx < valid; i++) {
+      u64 obj_ptr;
+      if (virtio_entry_to_ptr(&entries[i], &obj_ptr))
+        ptrs[idx++] = obj_ptr;
+    }
+
+    deallocate(ak_state.h, entries, entry_count * sizeof(ak_file_info_t));
+
+    if (count_out)
+      *count_out = idx;
+    return ptrs;
+  }
 
   default:
     return 0;
@@ -818,7 +1097,7 @@ boolean ak_backend_healthy(void) {
     return false;
 
   case AK_STORAGE_VIRTIO:
-    return ak_state.virtio_fd >= 0;
+    return ak_proxy_connected();
 
   default:
     return false;
@@ -854,13 +1133,20 @@ ak_response_t *ak_state_handle_commit(ak_agent_context_t *ctx,
   if (!ctx || !req)
     return ak_response_error(ak_state.h, req, AK_E_SCHEMA_INVALID);
 
-  /* Perform sync */
+  /* Perform sync. AK_SYNC_NO_BACKEND is not an error for commit (the
+   * anchor is still emitted to the local chain / audit log), but the
+   * response reports durable:false so callers cannot mistake an
+   * in-memory-only commit for durable persistence. */
   ak_sync_result_t sync_result = ak_state_sync_immediate();
 
   if (sync_result.status != AK_SYNC_COMPLETED &&
-      sync_result.status != AK_SYNC_PARTIAL) {
+      sync_result.status != AK_SYNC_PARTIAL &&
+      sync_result.status != AK_SYNC_NO_BACKEND) {
     return ak_response_error(ak_state.h, req, sync_result.error_code);
   }
+
+  boolean durable = (sync_result.status == AK_SYNC_COMPLETED ||
+                     sync_result.status == AK_SYNC_PARTIAL);
 
   /* Emit anchor */
   s64 anchor_result = ak_state_emit_anchor();
@@ -881,6 +1167,12 @@ ak_response_t *ak_state_handle_commit(ak_agent_context_t *ctx,
   len += prefix_len;
 
   len += u64_to_str(sync_result.objects_synced, &json[len]);
+
+  const char *durable_part =
+      durable ? ",\"durable\":true" : ",\"durable\":false";
+  u64 durable_len = runtime_strlen(durable_part);
+  runtime_memcpy(&json[len], durable_part, durable_len);
+  len += durable_len;
 
   const char *middle = ",\"anchor_sequence\":";
   u64 middle_len = runtime_strlen(middle);
@@ -1597,17 +1889,20 @@ s64 ak_state_load_from_disk(void) {
 }
 
 /*
- * ak_state_verify_file - Verify state file integrity without loading
+ * ak_state_verify_file - SHALLOW state file header check
  *
  * Parameters:
  *   path - Path to state file to verify
  *
  * Returns:
- *   0 if valid, negative error code if corrupt
+ *   0 if the header is well-formed, negative error code otherwise
  *
- * This function performs the same verification as ak_state_load_from_disk()
- * but without actually restoring objects to the heap. Useful for checking
- * backup files or validating state before recovery.
+ * HONESTY NOTE: this only reads the 64-byte header and checks the magic
+ * number and format version. It does NOT verify the merkle root or any
+ * per-object hashes, so a return of 0 is NOT an integrity guarantee.
+ * Full integrity verification (per-object hashes + merkle root) is
+ * performed by ak_state_load_from_disk(), which fails closed with
+ * AK_E_STATE_FILE_CORRUPT / AK_E_STATE_MERKLE_MISMATCH on mismatch.
  */
 s64 ak_state_verify_file(const char *path) {
 #ifndef KERNEL_STORAGE_ENABLED
@@ -1698,8 +1993,9 @@ s64 ak_state_verify_file(const char *path) {
   } else if (header->version != AK_STATE_FILE_VERSION) {
     result = AK_E_STATE_VERSION_MISMATCH;
   }
-  /* Full merkle verification would require reading entire file - skipped for
-   * quick verify */
+  /* Deliberately shallow: merkle/object-hash verification requires
+   * reading the entire file and is performed by ak_state_load_from_disk().
+   * A 0 result here means "header well-formed", NOT "content intact". */
 
   deallocate_buffer(header_buf);
   runtime_strncpy(ak_state_file_path, saved_path, sizeof(ak_state_file_path));

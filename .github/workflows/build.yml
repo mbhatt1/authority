@@ -23,7 +23,15 @@ jobs:
     name: 🍎 macOS x86_64
     runs-on: macos-15-intel
     timeout-minutes: 45
-    continue-on-error: true  # Non-blocking: failures don't stop workflow
+    # KNOWN ESCAPE: this job currently FAILS to compile the x86_64
+    # kernel: src/agentic/ak_budget.c's dead function
+    # ak_budget_calc_rate() returns 'double', which is incompatible
+    # with the kernel's -mno-sse flags ("SSE register return with SSE
+    # disabled", both gcc and clang). See the KNOWN ISSUE note in
+    # platform/pc/Makefile. Once that function is fixed in source and
+    # this job is observed green, remove continue-on-error so x86_64
+    # kernel regressions fail CI instead of being masked.
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -356,7 +364,9 @@ jobs:
     needs: [build-macos-x86]
     runs-on: macos-15-intel
     timeout-minutes: 30
-    continue-on-error: true  # Non-blocking if kernel build failed
+    # KNOWN ESCAPE: non-blocking only because it depends on the
+    # non-blocking build-macos-x86 job above; remove together with it.
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

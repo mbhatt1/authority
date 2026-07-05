@@ -262,6 +262,45 @@ static checkpoint_internal_t *find_checkpoint_internal(u64 checkpoint_id) {
 }
 
 /*
+ * Append bytes to a JSON string literal, escaping as needed.
+ *
+ * Escapes '"', '\\' and the control characters that the runtime JSON
+ * parser (src/runtime/json.c) knows how to unescape (\n \t \r \b \f).
+ * Other bytes are emitted verbatim; the parser round-trips them.
+ */
+static void state_json_escape(buffer out, const u8 *data, u64 len) {
+  for (u64 i = 0; i < len; i++) {
+    u8 c = data[i];
+    switch (c) {
+    case '"':
+      buffer_write(out, "\\\"", 2);
+      break;
+    case '\\':
+      buffer_write(out, "\\\\", 2);
+      break;
+    case '\n':
+      buffer_write(out, "\\n", 2);
+      break;
+    case '\t':
+      buffer_write(out, "\\t", 2);
+      break;
+    case '\r':
+      buffer_write(out, "\\r", 2);
+      break;
+    case '\b':
+      buffer_write(out, "\\b", 2);
+      break;
+    case '\f':
+      buffer_write(out, "\\f", 2);
+      break;
+    default:
+      buffer_write(out, &c, 1);
+      break;
+    }
+  }
+}
+
+/*
  * Clone a buffer.
  */
 static buffer clone_buffer(heap h, buffer src) {
@@ -464,14 +503,16 @@ u64 ak_checkpoint_create(ak_agent_context_t *ctx, const char *description) {
   if (!agent_ctx)
     return 0;
 
-  /* Check checkpoint limit */
+  /* Check checkpoint limit. Returned as (u64)negative error so callers
+   * can distinguish limit-hit from other failures; see
+   * AK_CHECKPOINT_ID_VALID() in ak_state_mgmt.h. */
   if (agent_ctx->checkpoint_count >= AK_MAX_CHECKPOINTS) {
-    return 0; /* Would return AK_E_TOO_MANY_CHECKPOINTS */
+    return (u64)AK_E_TOO_MANY_CHECKPOINTS;
   }
 
   /* Check if state is frozen */
   if (agent_ctx->migration.state == AK_MIGRATION_FROZEN) {
-    return 0; /* Would return AK_E_STATE_FROZEN */
+    return (u64)AK_E_STATE_FROZEN;
   }
 
   /* Allocate checkpoint */
@@ -506,8 +547,19 @@ u64 ak_checkpoint_create(ak_agent_context_t *ctx, const char *description) {
     return 0;
   }
 
-  /* Write state as JSON array */
-  buffer_write(state_buf, "[", 1);
+  /* Write state as a single JSON object mapping key -> value, where the
+   * value bytes are embedded as an escaped JSON string:
+   *
+   *   {"<key>":"<escaped value bytes>", ...}
+   *
+   * This format is chosen so restore can use the runtime JSON parser
+   * (src/runtime/json.c), which only accepts a top-level object and
+   * only preserves object and string values (arrays/numbers/literals
+   * are discarded by that parser). Embedding the raw value bytes as an
+   * escaped string makes the round-trip lossless regardless of what
+   * the value contains (nested quotes, arrays, etc.). A NULL value is
+   * written as the empty string and restored as NULL. */
+  buffer_write(state_buf, "{", 1);
   boolean first = true;
   u64 object_count = 0;
 
@@ -519,44 +571,22 @@ u64 ak_checkpoint_create(ak_agent_context_t *ctx, const char *description) {
           buffer_write(state_buf, ",", 1);
         first = false;
 
-        /* Write entry as {"key":"...","value":...,"version":N} */
-        buffer_write(state_buf, "{\"key\":\"", 8);
-        buffer_write(state_buf, entry->entry.key,
-                     runtime_strlen(entry->entry.key));
-        buffer_write(state_buf, "\",\"value\":", 10);
+        buffer_write(state_buf, "\"", 1);
+        state_json_escape(state_buf, (const u8 *)entry->entry.key,
+                          runtime_strlen(entry->entry.key));
+        buffer_write(state_buf, "\":\"", 3);
         if (entry->entry.value) {
-          u64 vlen = buffer_length(entry->entry.value);
-          buffer_write(state_buf, buffer_ref(entry->entry.value, 0), vlen);
-        } else {
-          buffer_write(state_buf, "null", 4);
+          state_json_escape(state_buf, buffer_ref(entry->entry.value, 0),
+                            buffer_length(entry->entry.value));
         }
-        buffer_write(state_buf, ",\"version\":", 11);
-
-        /* Write version number */
-        char vbuf[24];
-        int vlen = 0;
-        u64 v = entry->entry.version;
-        if (v == 0) {
-          vbuf[0] = '0';
-          vlen = 1;
-        } else {
-          char tmp[24];
-          while (v > 0) {
-            tmp[vlen++] = '0' + (v % 10);
-            v /= 10;
-          }
-          for (int j = 0; j < vlen; j++)
-            vbuf[j] = tmp[vlen - 1 - j];
-        }
-        buffer_write(state_buf, vbuf, vlen);
-        buffer_write(state_buf, "}", 1);
+        buffer_write(state_buf, "\"", 1);
 
         object_count++;
       }
       entry = entry->hash_next;
     }
   }
-  buffer_write(state_buf, "]", 1);
+  buffer_write(state_buf, "}", 1);
 
   cp->state_data = state_buf;
   cp->heap_object_count = object_count;
@@ -593,6 +623,55 @@ u64 ak_checkpoint_create(ak_agent_context_t *ctx, const char *description) {
   return cp->checkpoint_id;
 }
 
+/* ============================================================
+ * CHECKPOINT RESTORE PARSING
+ * ============================================================
+ * Checkpoint state_data is parsed with the runtime JSON parser
+ * (src/runtime/json.c) instead of a hand-rolled scanner, so escaped
+ * quotes and nested structures in values are handled correctly.
+ */
+
+closure_function(1, 1, void, checkpoint_state_parsed, tuple *, result,
+                 void *v) {
+  *bound(result) = (tuple)v;
+}
+
+closure_function(1, 1, void, checkpoint_state_parse_error, boolean *, failed,
+                 string err) {
+  (void)err;
+  *bound(failed) = true;
+}
+
+closure_function(2, 2, boolean, checkpoint_restore_each, ak_agent_context_t *,
+                 actx, u64 *, failed_entries, value k, value v) {
+  if (!is_symbol(k)) {
+    (*bound(failed_entries))++;
+    return true;
+  }
+
+  string name = symbol_string((symbol)k);
+  u64 key_len = name ? buffer_length(name) : 0;
+
+  /* Values are always encoded as JSON strings (see ak_checkpoint_create) */
+  if (key_len == 0 || key_len >= AK_MAX_KEY_LEN || !is_string(v)) {
+    (*bound(failed_entries))++;
+    return true; /* keep iterating; failures reported by caller */
+  }
+
+  char key[AK_MAX_KEY_LEN];
+  runtime_memcpy(key, buffer_ref(name, 0), key_len);
+  key[key_len] = '\0';
+
+  buffer val = (buffer)v;
+  if (buffer_length(val) == 0)
+    val = NULL; /* empty string encodes a NULL value */
+
+  if (ak_state_set(bound(actx), key, val) == 0)
+    (*bound(failed_entries))++;
+
+  return true;
+}
+
 s64 ak_checkpoint_restore(ak_agent_context_t *ctx, u64 checkpoint_id) {
   if (!state_mgmt.initialized)
     return AK_E_STATE_MGMT_NOT_INIT;
@@ -624,7 +703,27 @@ s64 ak_checkpoint_restore(ak_agent_context_t *ctx, u64 checkpoint_id) {
   if (!verify_state_hash(cp->state_data, cp->state_hash))
     return AK_E_CHECKPOINT_CORRUPT;
 
-  /* Create checkpoint of current state before restore */
+  /* Parse the checkpoint BEFORE making any destructive changes so a
+   * malformed checkpoint fails closed without touching current state. */
+  tuple parsed = 0;
+  boolean parse_failed = false;
+  parser jp =
+      json_parser(state_mgmt.h, stack_closure(checkpoint_state_parsed, &parsed),
+                  stack_closure(checkpoint_state_parse_error, &parse_failed));
+  if (!jp || jp == INVALID_ADDRESS)
+    return -ENOMEM;
+
+  jp = parser_feed(jp, cp->state_data);
+  jp = apply(jp, CHARACTER_INVALID);
+  json_parser_free(jp);
+
+  if (parse_failed || !parsed) {
+    if (parsed)
+      destruct_value(parsed, true);
+    return AK_E_CHECKPOINT_CORRUPT;
+  }
+
+  /* Create checkpoint of current state before restore (best effort) */
   ak_checkpoint_create(ctx, "Pre-restore backup");
 
   /* Clear current state entries for this agent */
@@ -644,101 +743,20 @@ s64 ak_checkpoint_restore(ak_agent_context_t *ctx, u64 checkpoint_id) {
     }
   }
 
-  /* Parse and restore state from checkpoint */
-  /* Simplified: assumes valid JSON array format */
-  u8 *data = buffer_ref(cp->state_data, 0);
-  u64 len = buffer_length(cp->state_data);
-  u64 pos = 1; /* Skip initial '[' */
-
-  while (pos < len - 1) { /* -1 to skip final ']' */
-    /* Skip whitespace and commas */
-    while (pos < len && (data[pos] == ' ' || data[pos] == ',' ||
-                         data[pos] == '\n' || data[pos] == '\t')) {
-      pos++;
-    }
-
-    if (pos >= len || data[pos] == ']')
-      break;
-
-    /* Parse entry object */
-    if (data[pos] != '{')
-      break;
-
-    /* Find key */
-    char *key_start = NULL;
-    u64 key_len = 0;
-    char *value_start = NULL;
-    u64 value_len = 0;
-
-    u64 obj_start = pos;
-    int brace_depth = 1;
-    pos++;
-
-    while (pos < len && brace_depth > 0) {
-      if (data[pos] == '{')
-        brace_depth++;
-      else if (data[pos] == '}')
-        brace_depth--;
-      pos++;
-    }
-
-    /* Extract key and value from the object (simplified parsing) */
-    /* Look for "key":"value" pattern */
-    for (u64 p = obj_start; p < pos - 10; p++) {
-      if (runtime_strncmp((char *)&data[p], "\"key\":\"", 7) == 0) {
-        key_start = (char *)&data[p + 7];
-        u64 end = p + 7;
-        while (end < pos && data[end] != '"')
-          end++;
-        key_len = end - (p + 7);
-      }
-      if (runtime_strncmp((char *)&data[p], "\"value\":", 8) == 0) {
-        value_start = (char *)&data[p + 8];
-        /* Find end of value (next comma or closing brace at same level) */
-        u64 end = p + 8;
-        int depth = 0;
-        while (end < pos) {
-          if (data[end] == '{' || data[end] == '[')
-            depth++;
-          else if (data[end] == '}' || data[end] == ']') {
-            if (depth == 0)
-              break;
-            depth--;
-          } else if (data[end] == ',' && depth == 0)
-            break;
-          end++;
-        }
-        value_len = end - (p + 8);
-      }
-    }
-
-    /* Create state entry from parsed data */
-    if (key_start && key_len > 0 && key_len < AK_MAX_KEY_LEN) {
-      char key[AK_MAX_KEY_LEN];
-      runtime_memcpy(key, key_start, key_len);
-      key[key_len] = '\0';
-
-      buffer value = NULL;
-      if (value_start && value_len > 0) {
-        value = allocate_buffer(state_mgmt.h, value_len);
-        if (value && value != INVALID_ADDRESS) {
-          buffer_write(value, value_start, value_len);
-        }
-      }
-
-      /* Set the restored state entry */
-      ak_state_set(ctx, key, value);
-
-      if (value)
-        deallocate_buffer(value);
-    }
-  }
+  /* Restore each key from the parsed checkpoint object */
+  u64 failed_entries = 0;
+  iterate(parsed,
+          stack_closure(checkpoint_restore_each, ctx, &failed_entries));
+  destruct_value(parsed, true);
 
   /* Update agent context */
   agent_ctx->current_seq = cp->seq_number;
 
   /* Update statistics */
   state_mgmt.stats.checkpoints_restored++;
+
+  if (failed_entries > 0)
+    return AK_E_CHECKPOINT_CORRUPT;
 
   return 0;
 }
@@ -1656,10 +1674,13 @@ u64 ak_state_prepare_migration(ak_agent_context_t *ctx) {
   if (agent_ctx->migration.state != AK_MIGRATION_NONE)
     return 0;
 
-  /* Create migration checkpoint */
+  /* Create migration checkpoint. ak_checkpoint_create() may return a
+   * (u64)negative error code (limit hit / frozen); propagate it so the
+   * caller can distinguish the failure reason. Never freeze state on a
+   * failed checkpoint. */
   u64 checkpoint_id = ak_checkpoint_create(ctx, "Migration checkpoint");
-  if (checkpoint_id == 0)
-    return 0;
+  if (!AK_CHECKPOINT_ID_VALID(checkpoint_id))
+    return checkpoint_id;
 
   /* Freeze state */
   agent_ctx->migration.state = AK_MIGRATION_FROZEN;

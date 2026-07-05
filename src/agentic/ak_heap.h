@@ -138,10 +138,22 @@ u64 *ak_heap_list_versions(heap h, u64 ptr, u64 *count_out);
 /*
  * Update taint level of object.
  *
- * SECURITY: Taint can only be decreased (made more trusted) by
- * passing through a sanitizer. Direct taint update is restricted.
+ * SECURITY: Taint is monotonic. This entry point can only keep or raise
+ * the taint level (toward AK_TAINT_UNTRUSTED); attempts to downgrade
+ * toward trusted return AK_E_TAINT. Downgrades are only possible via
+ * ak_heap_set_taint_sanitized() after actual sanitization.
  */
 s64 ak_heap_set_taint(u64 ptr, ak_taint_t new_taint, u64 expected_version);
+
+/*
+ * Privileged taint update for sanitizers.
+ *
+ * SECURITY: Allows lowering the taint level (e.g. untrusted ->
+ * sanitized_url). Must only be called by kernel sanitizer paths after
+ * the value has actually passed through the corresponding sanitizer.
+ */
+s64 ak_heap_set_taint_sanitized(u64 ptr, ak_taint_t new_taint,
+                                u64 expected_version);
 
 /*
  * Get taint level.
@@ -171,18 +183,28 @@ boolean ak_heap_validate_schema(u64 type_hash, buffer value);
 /*
  * Apply JSON Patch to value.
  *
+ * The patch must be an RFC 6902 array of operation objects, or a
+ * request envelope object with a "patch" member holding that array
+ * (as passed through by the AK_SYS_WRITE handler). Supported
+ * operations: "add", "replace", "remove", with JSON Pointer (RFC 6901)
+ * paths including array indices and "-" append. Unsupported operations
+ * (move, copy, test) and malformed patches/paths fail closed.
+ *
  * Returns: new value on success, NULL on error.
  * Caller must free returned buffer.
  */
 buffer ak_json_patch_apply(heap h, buffer original, buffer patch);
 
 /*
- * Validate JSON Patch syntax.
+ * Validate JSON Patch syntax (array of objects with "op" and "path").
  */
 boolean ak_json_patch_validate(buffer patch);
 
 /*
  * Create JSON Patch from diff.
+ *
+ * NOT IMPLEMENTED: always returns NULL (no in-tree callers). Do not
+ * treat a NULL result as "no changes".
  */
 buffer ak_json_patch_diff(heap h, buffer old_value, buffer new_value);
 
@@ -225,14 +247,22 @@ void ak_heap_get_stats(ak_heap_stats_t *stats);
 /*
  * Create heap snapshot.
  *
- * Returns serialized heap state for replay.
+ * Returns serialized heap state for replay:
+ *   {"version":1,"next_ptr":N,"object_count":N,"objects":[...]}
+ * where each entry is the ak_heap_serialize_object() format. Includes
+ * tombstones. Caller must free the returned buffer.
  */
 buffer ak_heap_snapshot(heap h);
 
 /*
- * Restore heap from snapshot.
+ * Restore heap objects from snapshot.
  *
- * WARNING: Clears current heap state!
+ * Accepts either a full snapshot (ak_heap_snapshot format) or a single
+ * serialized object (ak_heap_serialize_object format). Objects are
+ * upserted (merged) into the current heap; existing objects with other
+ * pointers are left untouched, so callers may hydrate object by object.
+ *
+ * Returns 0 on success, negative error on malformed input.
  */
 s64 ak_heap_restore(buffer snapshot);
 

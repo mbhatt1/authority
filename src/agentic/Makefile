@@ -16,57 +16,62 @@ include ../../vars.mk
 AK_MODULE := agentic
 
 # Kernel source files (compiled into kernel.elf)
+#
+# NOTE: The AUTHORITATIVE kernel source lists are SRCS-agentic in
+# platform/pc/Makefile, platform/virt/Makefile and
+# platform/riscv-virt/Makefile. This list mirrors that core set and
+# must be kept in sync with them.
+#
+# NOT in the kernel build (future work): ak_agentic.c, ak_context.c,
+# ak_effects.c, ak_posix_route.c, ak_policy_v2.c, ak_tool_registry.c,
+# ak_observe.c, ak_process.c, ak_state_mgmt.c, ak_stream.c,
+# ak_agent_ipc.c, ak_deny_ux.c, ak_fd_table.c, ak_policy_toml.c,
+# ak_record.c (duplicate symbols and unverified dependencies; see the
+# platform Makefiles for details).
 AK_SRCS := \
-	ak_agentic.c \
-	ak_capability.c \
+	ak_approval.c \
 	ak_audit.c \
 	ak_budget.c \
-	ak_context.c \
-	ak_deny_ux.c \
+	ak_capability.c \
 	ak_ed25519.c \
-	ak_effects.c \
 	ak_heap.c \
 	ak_inference.c \
 	ak_ipc.c \
 	ak_lz4.c \
 	ak_nanos.c \
+	ak_net_enforce.c \
 	ak_pattern.c \
 	ak_policy.c \
-	ak_policy_v2.c \
-	ak_posix_route.c \
 	ak_sanitize.c \
 	ak_secrets.c \
 	ak_state.c \
 	ak_syscall.c \
+	ak_virtio_proxy.c \
 	ak_wasm.c \
-	ak_wasm_host.c \
-	ak_approval.c
+	ak_wasm_host.c
 
 # Headers
 AK_HDRS := \
 	ak_types.h \
-	ak_agentic.h \
 	ak_approval.h \
+	ak_assert.h \
 	ak_audit.h \
 	ak_budget.h \
 	ak_capability.h \
 	ak_compat.h \
-	ak_compress.h \
-	ak_context.h \
-	ak_deny_ux.h \
+	ak_config.h \
 	ak_ed25519.h \
-	ak_effects.h \
 	ak_heap.h \
 	ak_inference.h \
 	ak_ipc.h \
+	ak_net_enforce.h \
 	ak_pattern.h \
 	ak_policy.h \
-	ak_policy_v2.h \
-	ak_posix_route.h \
 	ak_sanitize.h \
 	ak_secrets.h \
 	ak_state.h \
 	ak_syscall.h \
+	ak_virtio_proxy.h \
 	ak_wasm.h
 
 # Object files
@@ -177,19 +182,19 @@ distclean: clean
 	@rmdir $(LIBAK_LIBDIR) 2>/dev/null || true
 
 # Dependencies for kernel module
-ak_agentic.o: ak_agentic.c ak_agentic.h ak_types.h ak_effects.h ak_wasm.h ak_inference.h ak_policy_v2.h ak_compat.h
 ak_capability.o: ak_capability.c ak_capability.h ak_types.h
 ak_audit.o: ak_audit.c ak_audit.h ak_types.h
 ak_budget.o: ak_budget.c ak_budget.h ak_types.h ak_compat.h
 ak_heap.o: ak_heap.c ak_heap.h ak_types.h ak_audit.h
 ak_ipc.o: ak_ipc.c ak_ipc.h ak_types.h ak_capability.h
+ak_net_enforce.o: ak_net_enforce.c ak_net_enforce.h ak_audit.h ak_budget.h ak_capability.h ak_sanitize.h
 ak_policy.o: ak_policy.c ak_policy.h ak_types.h ak_capability.h
 ak_syscall.o: ak_syscall.c ak_syscall.h ak_types.h ak_capability.h ak_audit.h ak_heap.h ak_policy.h ak_ipc.h ak_budget.h
 ak_nanos.o: ak_nanos.c ak_syscall.h
-ak_posix_route.o: ak_posix_route.c ak_posix_route.h ak_effects.h ak_context.h ak_compat.h
 
-# Integration with main kernel build
-# Add the following to kernel.mk:
-#
-# KERNEL_SRCS += $(wildcard $(SRCDIR)/agentic/*.c)
-# KERNEL_CFLAGS += -I$(SRCDIR)/agentic -DCONFIG_AK_ENABLED=1
+# Integration with main kernel build:
+# the kernel compiles SRCS-agentic as listed in the platform Makefiles
+# (platform/{pc,virt,riscv-virt}/Makefile), NOT via this Makefile.
+# Do NOT use $(wildcard $(SRCDIR)/agentic/*.c): several sources in this
+# directory are intentionally excluded from the kernel build (see the
+# comment above AK_SRCS).

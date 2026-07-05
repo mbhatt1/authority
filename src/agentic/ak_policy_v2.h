@@ -48,7 +48,8 @@
  */
 
 typedef struct ak_fs_rule_v2 {
-  char pattern[AK_POLICY_V2_MAX_PATTERN]; /* Glob pattern: /app/**, /tmp/* */
+  char pattern[AK_POLICY_V2_MAX_PATTERN]; /* Glob path pattern with * and
+                                           * ** wildcards */
   boolean read;                           /* Allow read access */
   boolean write;                          /* Allow write access */
   struct ak_fs_rule_v2 *next;
@@ -128,8 +129,8 @@ typedef struct ak_infer_rule_v2 {
  */
 
 typedef struct ak_spawn_rule_v2 {
-  char pattern[AK_POLICY_V2_MAX_PATTERN]; /* Program path pattern: "/usr/bin/*"
-                                           */
+  char pattern[AK_POLICY_V2_MAX_PATTERN]; /* Program path glob pattern,
+                                           * e.g. everything under /usr/bin */
   boolean allow;                          /* Allow spawn */
   boolean inherit_caps;                   /* Child inherits caps */
   boolean inherit_policy;                 /* Child inherits policy */
@@ -167,6 +168,17 @@ typedef struct ak_policy_v2 {
   char version[16];             /* Policy format version */
   u8 policy_hash[AK_HASH_SIZE]; /* SHA-256 of policy content */
   u64 loaded_ns;                /* Load timestamp (monotonic) */
+
+  /*
+   * Integrity: HMAC-SHA256 authentication tag (symmetric - anyone with
+   * the key can forge; this is NOT an Ed25519 digital signature).
+   * Parsed from the top-level "signature" member (64 hex chars).
+   * The tag covers SHA-256 of the document with the signature value
+   * emptied ("signature":"").
+   */
+  u8 signature[AK_MAC_SIZE];  /* HMAC-SHA256 tag */
+  boolean has_signature;      /* "signature" was present in document */
+  boolean signature_verified; /* Tag verified against configured key */
 
   /* Filesystem capabilities */
   ak_fs_rule_v2_t *fs_rules;
@@ -240,11 +252,29 @@ void ak_policy_v2_shutdown(void);
  * ============================================================ */
 
 /*
+ * Configure the HMAC-SHA256 policy verification key (AK_KEY_SIZE bytes).
+ *
+ * Once set, ak_policy_v2_load() rejects any policy whose HMAC tag does
+ * not verify (including unsigned policies).  Pass NULL to clear the key
+ * (subsequent loads accept policies but flag them unsigned).
+ *
+ * NOTE: symmetric authentication (HMAC-SHA256), not an Ed25519 signature.
+ */
+void ak_policy_v2_set_verification_key(const u8 *key);
+
+/*
  * Load policy from JSON buffer.
+ *
+ * SECURITY (fail-closed):
+ *   - If a verification key is configured, unsigned or wrongly-tagged
+ *     policies are REJECTED (NULL).
+ *   - If no key is configured, the policy is accepted but
+ *     signature_verified stays false (never treated as verified).
  *
  * Parses the P0 JSON policy format:
  * {
  *   "version": "1.0",
+ *   "signature": "<64 hex chars, optional HMAC-SHA256 tag>",
  *   "fs": { "read": [...], "write": [...] },
  *   "net": { "dns": [...], "connect": [...] },
  *   "tools": { "allow": [...], "deny": [...] },

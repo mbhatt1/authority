@@ -135,7 +135,18 @@ SRCS-kernel.elf= \
 	$(SRCS-agentic)
 
 # ============================================================
-# Authority Kernel Sources
+# Authority Kernel Sources (core set)
+#
+# NOT in the kernel build (future work; see src/agentic/):
+#   ak_agentic.c, ak_context.c, ak_effects.c, ak_posix_route.c,
+#   ak_policy_v2.c, ak_tool_registry.c, ak_observe.c, ak_process.c,
+#   ak_state_mgmt.c, ak_stream.c, ak_agent_ipc.c, ak_deny_ux.c,
+#   ak_fd_table.c, ak_policy_toml.c, ak_record.c
+# Reasons: duplicate symbols with the core set (ak_tool_registry.c vs
+# ak_wasm.c; ak_agent_ipc.c vs ak_ipc.c), unresolved cross-dependencies
+# (ak_agentic.c/ak_posix_route.c require ak_effects.c and ak_context.c),
+# and code that has not been verified to compile/link in the kernel
+# environment. Keep this list in sync across platform/{pc,virt,riscv-virt}.
 # ============================================================
 SRCS-agentic= \
 	$(SRCDIR)/agentic/ak_capability.c \
@@ -143,10 +154,13 @@ SRCS-agentic= \
 	$(SRCDIR)/agentic/ak_budget.c \
 	$(SRCDIR)/agentic/ak_heap.c \
 	$(SRCDIR)/agentic/ak_ipc.c \
+	$(SRCDIR)/agentic/ak_net_enforce.c \
 	$(SRCDIR)/agentic/ak_policy.c \
 	$(SRCDIR)/agentic/ak_syscall.c \
+	$(SRCDIR)/agentic/ak_transport.c \
 	$(SRCDIR)/agentic/ak_nanos.c \
 	$(SRCDIR)/agentic/ak_wasm.c \
+	$(SRCDIR)/agentic/ak_wasm_interp.c \
 	$(SRCDIR)/agentic/ak_wasm_host.c \
 	$(SRCDIR)/agentic/ak_inference.c \
 	$(SRCDIR)/agentic/ak_state.c \
@@ -221,6 +235,9 @@ AFLAGS+=-I$(ARCHDIR)
 CFLAGS+=-DCONFIG_LTRACE
 CFLAGS+=-DCONFIG_AK_ENABLED
 CFLAGS+=-DCONFIG_SYSCALL_AGENTIC=1
+# Socket-layer network enforcement hooks in src/net/netsyscall.c
+# (requires ak_net_enforce.c in SRCS-agentic above)
+CFLAGS+=-DCONFIG_AGENTIC
 
 AFLAGS+=	-I$(OBJDIR)/
 

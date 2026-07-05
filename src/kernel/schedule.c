@@ -182,6 +182,28 @@ static inline boolean service_async_1(queue q)
     return dequeued;
 }
 
+/* Cooperative pump for in-kernel synchronous waiters.
+ *
+ * Services the deferred-work queues that drive asynchronous I/O completions -
+ * cpu-local ops, the bottom-half queue (network-stack work enqueued by RX/timer
+ * interrupt handlers), deferred status handlers (virtqueue completions land here
+ * via async_apply_1), and deferred memory work. It deliberately does NOT service
+ * the runqueue, so it never reschedules other threads - it only advances the
+ * async operations a syscall-context caller (e.g. the HTTPS transport) is
+ * waiting on. Declared in kernel.h. Returns when the serviced queues are
+ * momentarily empty. */
+void process_bhqueue(void)
+{
+    cpuinfo ci = current_cpu();
+    boolean work_done;
+    do {
+        work_done = service_thunk_queue(ci->cpu_queue);
+        work_done = service_thunk_queue(bhqueue) || work_done;
+        work_done = service_async_1(async_queue_1) || work_done;
+        work_done = mem_service() || work_done;
+    } while (work_done);
+}
+
 NOTRACE void __attribute__((noreturn)) runloop_internal(void)
 {
     cpuinfo ci = current_cpu();

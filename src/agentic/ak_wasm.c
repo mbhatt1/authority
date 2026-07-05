@@ -18,6 +18,7 @@
 #include "ak_compat.h"
 #include "ak_ed25519.h"
 #include "ak_syscall.h"
+#include "ak_wasm_interp.h"
 
 /* ============================================================
  * INTERNAL STATE
@@ -229,7 +230,7 @@ ak_wasm_module_t *ak_wasm_module_load(heap h, const char *name, buffer bytecode,
   module->verified = false;
 
   /* Timestamps */
-  module->loaded_ms = 0; /* Would use kern_now() in real impl */
+  module->loaded_ms = ak_now_ms();
   module->last_used_ms = 0;
   module->invocation_count = 0;
 
@@ -292,10 +293,12 @@ ak_wasm_module_t *ak_wasm_module_fetch(heap h, const char *name,
                                        const char *url,
                                        ak_capability_t *net_cap) {
   /*
-   * Fetch module from network.
-   * This would use the network stack to download the WASM bytecode.
-   *
-   * SECURITY: Validates net_cap covers the URL before fetch.
+   * NOT SUPPORTED: There is no in-kernel HTTP client, so network fetch
+   * of WASM modules cannot be performed. The capability is still
+   * validated (consistent enforcement, no probing of unauthorized
+   * URLs), but this function ALWAYS returns NULL - fail-closed.
+   * Modules must be loaded from local bytecode via
+   * ak_wasm_module_load()/ak_wasm_module_load_verified().
    */
   if (!ak_wasm_state.initialized)
     return 0;
@@ -311,8 +314,7 @@ ak_wasm_module_t *ak_wasm_module_fetch(heap h, const char *name,
   if (result != 0)
     return 0;
 
-  /* Network fetch requires HTTP client integration */
-  /* Return NULL - modules must be loaded from local bytecode */
+  /* No network fetch backend exists; fail closed with no module. */
   return 0;
 }
 
@@ -561,7 +563,7 @@ s64 ak_wasm_exec_suspend(ak_wasm_exec_ctx_t *ctx,
   /* Save suspension state */
   ctx->state = AK_WASM_STATE_SUSPENDED;
   ctx->suspension.reason = reason;
-  ctx->suspension.suspend_time_ms = 0; /* Would use kern_now() */
+  ctx->suspension.suspend_time_ms = ak_now_ms();
   ctx->suspension.resume_callback = resume_cb;
   ctx->suspension.timeout_ms = timeout_ms;
   ctx->suspension.approval_id = 0;
@@ -581,13 +583,13 @@ s64 ak_wasm_exec_suspend(ak_wasm_exec_ctx_t *ctx,
   }
 
   /*
-   * In a real implementation, this would:
-   * 1. Save WASM execution state (stack, locals, PC)
-   * 2. Return control to the scheduler
-   * 3. The scheduler resumes when resume_cb is called or timeout expires
-   *
-   * For this kernel implementation, the userspace supervisor handles
-   * the actual WASM state; we just track the reason and callback.
+   * LIMITATION (documented, not fabricated): this does NOT save WASM
+   * machine state (stack, locals, PC). The interpreter and its state
+   * live in the userspace supervisor. Kernel-side "suspend" is
+   * bookkeeping only: it records the reason/timestamp/callback and
+   * checkpoints the opaque, caller-provided blob copied above.
+   * Resumption correctness depends on the supervisor holding the real
+   * interpreter state.
    */
 
   return 0;
@@ -625,13 +627,10 @@ s64 ak_wasm_exec_resume(ak_wasm_exec_ctx_t *ctx, void *result, u64 result_len) {
   ctx->suspension.reason = AK_WASM_SUSPEND_NONE;
 
   /*
-   * In a real implementation, this would:
-   * 1. Restore WASM execution state
-   * 2. Push result onto WASM stack
-   * 3. Continue execution
-   *
-   * For this kernel implementation, the userspace supervisor handles
-   * actual WASM state; we signal readiness to continue.
+   * LIMITATION (documented, not fabricated): no WASM machine state is
+   * restored here. The kernel only stores the opaque result blob for
+   * the userspace supervisor to deliver into the interpreter, and
+   * flips the context back to RUNNING. Mirrors ak_wasm_exec_suspend().
    */
 
   return 0;
@@ -657,39 +656,72 @@ s64 ak_wasm_exec_run(ak_wasm_exec_ctx_t *ctx, buffer input) {
 
   ctx->input = input;
   ctx->state = AK_WASM_STATE_RUNNING;
-  ctx->start_ms = 0; /* Would use kern_now() */
-
-  /*
-   * WASM execution architecture:
-   *
-   * The WASM interpreter (wasm3) runs in userspace supervisor.
-   * The kernel's role is to:
-   *   1. Validate capabilities for host calls
-   *   2. Track resource usage
-   *   3. Enforce timeouts
-   *
-   * Execution returns empty output when no WASM runtime is linked.
-   */
-
-  /* Create empty output */
-  ctx->output = allocate_buffer(ak_wasm_state.h, 2);
-  if (ctx->output == INVALID_ADDRESS) {
-    ctx->output = 0;
-    ctx->state = AK_WASM_STATE_OOM;
-    ctx->result_code = AK_E_WASM_OOM;
-    ak_wasm_state.stats.executions_total++;
-    ak_wasm_state.stats.executions_oom++;
-    return AK_E_WASM_OOM;
-  }
-
-  buffer_write(ctx->output, "{}", 2);
-  ctx->state = AK_WASM_STATE_COMPLETED;
-  ctx->result_code = 0;
+  ctx->start_ms = ak_now_ms();
 
   ak_wasm_state.stats.executions_total++;
-  ak_wasm_state.stats.executions_success++;
 
-  return 0;
+  /*
+   * IN-KERNEL EXECUTION (integer-only WASM subset):
+   *
+   * The kernel is compiled -mno-sse / no hardware float and links no
+   * soft-float runtime, and no full WASM interpreter (wasm3 or otherwise)
+   * exists in the tree. A complete WASM interpreter therefore cannot run
+   * here (the spec mandates f32/f64). Instead we run a strict, bounded,
+   * INTEGER-ONLY subset via ak_wasm_interp_run(): it validates the module
+   * structurally, REJECTS fail-closed any module that declares/uses float
+   * types or opcodes or anything outside the supported integer subset, and
+   * genuinely interprets the exported entry function otherwise.
+   *
+   * We only report COMPLETED (and count a success) on a genuine result;
+   * validation failure, trap, gas exhaustion and OOM all fail closed with
+   * an honest error code and the corresponding failure counter.
+   */
+  if (!ctx->module || !ctx->tool) {
+    ctx->state = AK_WASM_STATE_FAILED;
+    ctx->result_code = AK_E_WASM_INVALID_MODULE;
+    ctx->elapsed_ms = ak_now_ms() - ctx->start_ms;
+    ak_wasm_state.stats.executions_failed++;
+    return AK_E_WASM_INVALID_MODULE;
+  }
+
+  buffer output = 0;
+  u64 gas_used = 0;
+  s64 result_value = 0;
+  s64 rc = ak_wasm_interp_run(
+      ak_wasm_state.h, ctx, ctx->module->bytecode, ctx->tool->export_name,
+      input, &output, ctx->module->max_instructions, &gas_used, &result_value);
+
+  ctx->instructions_used = gas_used;
+  ak_wasm_state.stats.total_instructions += gas_used;
+  ctx->elapsed_ms = ak_now_ms() - ctx->start_ms;
+  ak_wasm_state.stats.total_runtime_ms += ctx->elapsed_ms;
+
+  if (rc == 0) {
+    /* Genuine completion: attach the real output and count a success. */
+    ctx->output = output;
+    ctx->result_code = result_value;
+    ctx->state = AK_WASM_STATE_COMPLETED;
+    ak_wasm_state.stats.executions_success++;
+    return 0;
+  }
+
+  /* Failure paths - never fabricate output. */
+  if (output && output != INVALID_ADDRESS)
+    deallocate_buffer(output);
+  ctx->output = 0;
+  ctx->result_code = rc;
+
+  if (rc == AK_E_WASM_TIMEOUT) {
+    ctx->state = AK_WASM_STATE_TIMEOUT;
+    ak_wasm_state.stats.executions_timeout++;
+  } else if (rc == AK_E_WASM_OOM) {
+    ctx->state = AK_WASM_STATE_OOM;
+    ak_wasm_state.stats.executions_oom++;
+  } else {
+    ctx->state = AK_WASM_STATE_FAILED;
+    ak_wasm_state.stats.executions_failed++;
+  }
+  return rc;
 }
 
 /* ============================================================
@@ -730,33 +762,30 @@ ak_response_t *ak_wasm_execute_tool(ak_agent_context_t *agent,
   /* Step 4: Run WASM */
   s64 result = ak_wasm_exec_run(ctx, args);
 
-  /* Step 5: Create response */
+  /* Step 5: Create response
+   *
+   * Success is reported ONLY when the execution backend actually
+   * completed the run (state == COMPLETED with a result). Otherwise
+   * this fails closed with the honest error code from the context -
+   * including AK_E_NOT_IMPLEMENTED when no WASM runtime backend is
+   * connected. Execution stats are accounted in ak_wasm_exec_run();
+   * they are not incremented again here (no double-counting).
+   */
   ak_response_t *response;
   if (result == 0 && ctx->state == AK_WASM_STATE_COMPLETED) {
     response = ak_response_success(ak_wasm_state.h, 0, ctx->output);
     ctx->output = 0; /* Ownership transferred */
   } else {
-    s64 error_code;
-    switch (ctx->state) {
-    case AK_WASM_STATE_TIMEOUT:
-      error_code = AK_E_WASM_TIMEOUT;
-      ak_wasm_state.stats.executions_timeout++;
-      break;
-    case AK_WASM_STATE_OOM:
-      error_code = AK_E_WASM_OOM;
-      ak_wasm_state.stats.executions_oom++;
-      break;
-    case AK_WASM_STATE_FAILED:
-    default:
+    s64 error_code = ctx->result_code;
+    if (error_code == 0)
+      error_code = result;
+    if (error_code == 0)
       error_code = AK_E_WASM_TRAP;
-      ak_wasm_state.stats.executions_failed++;
-      break;
-    }
     response = ak_response_error(ak_wasm_state.h, 0, error_code);
   }
 
   /* Update module usage stats */
-  tool->module->last_used_ms = 0; /* Would use kern_now() */
+  tool->module->last_used_ms = ak_now_ms();
   tool->module->invocation_count++;
 
   /* Cleanup */

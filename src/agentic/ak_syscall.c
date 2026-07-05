@@ -150,6 +150,28 @@ static s64 ak_json_extract_string(buffer json, const char *key, char *out,
   return -1;
 }
 
+/*
+ * Format u64 as decimal string. buf must hold at least 21 bytes.
+ * Used to build capability resource strings (heap ptr / type hash),
+ * matching the convention in ak_wasm_host.c heap host functions.
+ */
+static void ak_u64_to_dec(u64 v, char *buf) {
+  int len = 0;
+  if (v == 0) {
+    buf[0] = '0';
+    len = 1;
+  } else {
+    char tmp[20];
+    while (v > 0) {
+      tmp[len++] = '0' + (v % 10);
+      v /= 10;
+    }
+    for (int i = 0; i < len; i++)
+      buf[i] = tmp[len - 1 - i];
+  }
+  buf[len] = 0;
+}
+
 /* ============================================================
  * INITIALIZATION
  * ============================================================ */
@@ -244,6 +266,22 @@ ak_agent_context_t *ak_context_create(heap h, u8 *pid, ak_policy_t *policy) {
 
   ctx->heap = h;
 
+  /*
+   * Delegated capability store. Each granted capability is a distinct
+   * allocation, so an identity-keyed table (keyed by the address of the
+   * cap's tid field) acts as an iterable set. Without this table,
+   * ak_grant_capability() silently dropped every grant. A non-empty
+   * store means the agent is confined to its granted capabilities
+   * (see ak_validate_capability); an empty store defers to policy.
+   */
+  ctx->delegated_caps = allocate_table(h, identity_key, pointer_equal);
+  if (ctx->delegated_caps == INVALID_ADDRESS) {
+    ak_seq_tracker_destroy(h, ctx->seq_tracker);
+    ak_budget_destroy(h, ctx->budget);
+    deallocate(h, ctx, sizeof(ak_agent_context_t));
+    return NULL;
+  }
+
   /* Log agent creation */
   ak_audit_log_lifecycle(ctx->pid, ctx->run_id, AK_LIFECYCLE_SPAWN);
 
@@ -266,6 +304,17 @@ void ak_context_destroy(heap h, ak_agent_context_t *ctx) {
 
   if (ctx->seq_tracker)
     ak_seq_tracker_destroy(h, ctx->seq_tracker);
+
+  /* Free the delegated capability store and the caps it owns. */
+  if (ctx->delegated_caps) {
+    table_foreach(ctx->delegated_caps, k, v) {
+      (void)k;
+      if (v)
+        deallocate(h, v, sizeof(ak_capability_t));
+    }
+    deallocate_table(ctx->delegated_caps);
+    ctx->delegated_caps = 0;
+  }
 
   deallocate(h, ctx, sizeof(ak_agent_context_t));
 }
@@ -447,8 +496,9 @@ ak_response_t *ak_dispatch(ak_agent_context_t *ctx, ak_request_t *req) {
     break;
   }
 
-  if (req->op < 16)
-    ak_state.stats.op_counts[req->op]++;
+  /* Ops are absolute AK_SYS_* numbers (1024+); index relative to base */
+  if (req->op >= AK_SYS_BASE && req->op - AK_SYS_BASE < 16)
+    ak_state.stats.op_counts[req->op - AK_SYS_BASE]++;
 
 audit_and_return:
   /*
@@ -505,8 +555,9 @@ s64 ak_validate_request(ak_agent_context_t *ctx, ak_request_t *req) {
   if (!ak_token_id_equal(req->run_id, ctx->run_id))
     return AK_E_CAP_RUN_MISMATCH;
 
-  /* Check op is valid */
-  if (req->op < AK_SYS_READ || req->op > AK_SYS_INFERENCE)
+  /* Check op is valid (includes budget introspection ops, which
+   * ak_dispatch handles) */
+  if (req->op < AK_SYS_READ || req->op > AK_SYS_BUDGET_BREAKDOWN)
     return -EINVAL;
 
   return 0;
@@ -523,51 +574,154 @@ s64 ak_validate_capability(ak_agent_context_t *ctx, ak_request_t *req) {
   if (!ctx || !req)
     return -EINVAL;
 
-  /* READ operations don't require capability (read-only) */
-  if (req->op == AK_SYS_READ || req->op == AK_SYS_QUERY)
+  /*
+   * Budget introspection ops read only ctx->budget: self-scoped by
+   * construction, no external effect, so no capability is required.
+   */
+  if (req->op == AK_SYS_BUDGET_STATUS || req->op == AK_SYS_BUDGET_HISTORY ||
+      req->op == AK_SYS_BUDGET_BREAKDOWN)
     return 0;
 
-  /* All effectful operations require capability */
-  if (!req->cap)
-    return AK_E_CAP_INVALID;
-
-  /* Determine required capability type */
+  /* Determine required capability type and the REAL target resource */
   ak_cap_type_t required_type;
-  const char *resource = "*"; /* Default */
   const char *method = NULL;
+  const char *resource = NULL;
+  char resource_buf[80];
 
   switch (req->op) {
-  case AK_SYS_ALLOC:
+  case AK_SYS_READ:
   case AK_SYS_WRITE:
   case AK_SYS_DELETE:
+    /* Scope is confined on the target heap pointer, formatted as a
+     * decimal string (same convention as ak_wasm_host.c heap hosts). */
     required_type = AK_CAP_HEAP;
+    ak_u64_to_dec(ak_json_extract_u64(req->args, "ptr"), resource_buf);
+    resource = resource_buf;
+    method = ak_op_to_string(req->op);
+    break;
+  case AK_SYS_ALLOC:
+    /* No object exists yet; confine on the requested type hash. */
+    required_type = AK_CAP_HEAP;
+    ak_u64_to_dec(ak_json_extract_u64(req->args, "type"), resource_buf);
+    resource = resource_buf;
+    method = ak_op_to_string(req->op);
+    break;
+  case AK_SYS_BATCH:
+    /* Batch wraps heap ops; per-op ptrs/versions are re-validated by
+     * the transaction layer, so gate the batch on heap capability. */
+    required_type = AK_CAP_HEAP;
+    resource = "*";
     method = ak_op_to_string(req->op);
     break;
   case AK_SYS_CALL:
     required_type = AK_CAP_TOOL;
+    if (ak_json_extract_string(req->args, "tool", resource_buf,
+                               sizeof(resource_buf)) <= 0)
+      return AK_E_CAP_SCOPE; /* Fail-closed: no tool name, no scope match */
+    resource = resource_buf;
     method = "invoke";
     break;
   case AK_SYS_INFERENCE:
     required_type = AK_CAP_LLM;
+    if (ak_json_extract_string(req->args, "model", resource_buf,
+                               sizeof(resource_buf)) <= 0)
+      return AK_E_CAP_SCOPE; /* Fail-closed: unknown inference target */
+    resource = resource_buf;
     method = "inference";
     break;
   case AK_SYS_SPAWN:
     required_type = AK_CAP_SPAWN;
+    /* Confine on the requested program when present; a bare spawn
+     * creates an attenuated child of self. */
+    if (req->args && ak_json_extract_string(req->args, "program", resource_buf,
+                                            sizeof(resource_buf)) > 0)
+      resource = resource_buf;
+    else
+      resource = "*";
     method = "spawn";
     break;
   case AK_SYS_SEND:
-  case AK_SYS_RECV:
     required_type = AK_CAP_IPC;
+    if (ak_json_extract_string(req->args, "to", resource_buf,
+                               sizeof(resource_buf)) <= 0)
+      return AK_E_CAP_SCOPE; /* Fail-closed: no recipient, no scope match */
+    resource = resource_buf;
+    method = ak_op_to_string(req->op);
+    break;
+  case AK_SYS_RECV:
+    /* RECV dequeues only from the caller's own inbox (looked up by
+     * ctx->pid), so the target is self by construction. */
+    required_type = AK_CAP_IPC;
+    resource = "*";
+    method = ak_op_to_string(req->op);
+    break;
+  case AK_SYS_QUERY:
+    /* Audit-log read; no dedicated cap type exists, so require any
+     * valid run-bound capability scoped to the audit log. */
+    required_type = AK_CAP_ANY;
+    resource = "audit_log";
     method = ak_op_to_string(req->op);
     break;
   default:
+    /* COMMIT/RESPOND/ASSERT have no target object */
     required_type = AK_CAP_ANY;
+    resource = "*";
+    method = ak_op_to_string(req->op);
     break;
   }
 
-  /* Full capability validation */
-  return ak_capability_validate(req->cap, required_type, resource, method,
-                                ctx->run_id);
+  /*
+   * INV-2 (capability attenuation), three-way authorization:
+   *
+   * 1. Explicit token: if the request carries a capability, it is FULLY
+   *    enforced (HMAC verify + scope + TTL + revocation). This is how an
+   *    attenuated child presents a delegated subset of authority.
+   */
+  if (req->cap)
+    return ak_capability_validate(req->cap, required_type, resource, method,
+                                  ctx->run_id);
+
+  /*
+   * 2. Ambient root authority: a context holding root_cap IS the
+   *    single-tenant privileged root. Its admin capability is validated
+   *    here like any other (HMAC + revocation + scope), so a revoked or
+   *    expired root cap fails closed; AK_CAP_ADMIN subsumes any required
+   *    type. Checked before the delegated store so root is never
+   *    accidentally confined by a stray grant. Sub-agents never hold a
+   *    root_cap.
+   */
+  if (ctx->root_cap) {
+    s64 rv = ak_capability_validate(ctx->root_cap, required_type, resource,
+                                    method, ctx->run_id);
+    if (rv == 0)
+      req->cap = ctx->root_cap; /* expose effective authority to handlers */
+    return rv;
+  }
+
+  /*
+   * 3. Delegated store: a sub-agent granted capabilities
+   *    (ak_grant_capability populated ctx->delegated_caps) is CONFINED to
+   *    them. Allow only if a granted, still-valid capability subsumes the
+   *    request; otherwise deny (fail-closed).
+   */
+  if (ctx->delegated_caps && table_elements(ctx->delegated_caps) > 0) {
+    table_foreach(ctx->delegated_caps, k, v) {
+      (void)k;
+      if (v && ak_capability_validate((ak_capability_t *)v, required_type,
+                                      resource, method, ctx->run_id) == 0) {
+        req->cap = (ak_capability_t *)v; /* expose granted cap to handlers */
+        return 0;                        /* a granted capability subsumes it */
+      }
+    }
+    return AK_E_CAP_SCOPE; /* confined agent, no matching grant */
+  }
+
+  /*
+   * 4. No token, no ambient authority, no delegated grant: DENY.
+   *    Confinement is mandatory - an agent with no capability of any
+   *    kind can perform no effect.
+   */
+  return AK_E_CAP_MISSING;
 }
 
 s64 ak_check_policy(ak_agent_context_t *ctx, ak_request_t *req) {
@@ -717,8 +871,15 @@ ak_response_t *ak_handle_delete(ak_agent_context_t *ctx, ak_request_t *req) {
   if (!req->args)
     return ak_response_error(ctx->heap, req, -EINVAL);
 
-  u64 ptr = 0;
-  u64 expected_version = 1;
+  /* Parse target pointer and CAS version from args (same convention as
+   * ak_handle_read/ak_handle_write). The extractor returns 0 when a key
+   * is missing or malformed; 0 is never a valid heap ptr (ak_heap_alloc
+   * returns 0 on failure) and versions start at 1, so fail-closed
+   * instead of deleting a default object. */
+  u64 ptr = ak_json_extract_u64(req->args, "ptr");
+  u64 expected_version = ak_json_extract_u64(req->args, "version");
+  if (ptr == 0 || expected_version == 0)
+    return ak_response_error(ctx->heap, req, AK_E_SCHEMA_INVALID);
 
   s64 err = ak_heap_delete(ptr, expected_version);
   if (err != 0)
@@ -807,12 +968,18 @@ ak_response_t *ak_handle_query(ak_agent_context_t *ctx, ak_request_t *req) {
   filter.run_id = has_run_id_filter ? filter_run_id : NULL;
   filter.op = filter_op;
 
-  /* Execute query */
-  u64 count = 0;
+  /* Execute query.
+   *
+   * CONTRACT (ak_audit_query): the returned ARRAY is allocated on our
+   * heap (sized by the full match count), but each element points INTO
+   * live audit segment storage. Entry pointers are BORROWED and must
+   * never be deallocated; only the array container is ours to free. */
+  u64 total_count = 0;
   ak_log_entry_t **entries =
-      ak_audit_query(ctx->heap, &filter, start_seq, end_seq, &count);
+      ak_audit_query(ctx->heap, &filter, start_seq, end_seq, &total_count);
 
-  /* Apply limit */
+  /* Apply limit (keep total_count for container deallocation) */
+  u64 count = total_count;
   if (count > limit)
     count = limit;
 
@@ -824,14 +991,9 @@ ak_response_t *ak_handle_query(ak_agent_context_t *ctx, ak_request_t *req) {
 
   buffer result = allocate_buffer(ctx->heap, buf_size);
   if (!result) {
-    /* Cleanup entries if allocated */
-    if (entries) {
-      for (u64 i = 0; i < count; i++) {
-        if (entries[i])
-          deallocate(ctx->heap, entries[i], sizeof(ak_log_entry_t));
-      }
-      deallocate(ctx->heap, entries, sizeof(ak_log_entry_t *) * count);
-    }
+    /* Free only the array container - entries are borrowed (see above) */
+    if (entries)
+      deallocate(ctx->heap, entries, sizeof(ak_log_entry_t *) * total_count);
     return ak_response_error(ctx->heap, req, -ENOMEM);
   }
 
@@ -967,14 +1129,13 @@ ak_response_t *ak_handle_query(ak_agent_context_t *ctx, ak_request_t *req) {
   buffer_write(result, count_buf, count_len);
   buffer_write(result, "}", 1);
 
-  /* Cleanup entries */
-  if (entries) {
-    for (u64 i = 0; i < count; i++) {
-      if (entries[i])
-        deallocate(ctx->heap, entries[i], sizeof(ak_log_entry_t));
-    }
-    deallocate(ctx->heap, entries, sizeof(ak_log_entry_t *) * count);
-  }
+  /* Cleanup: all needed fields were copied into the JSON result above.
+   * entries[i] point into live audit segment storage (borrowed) - do
+   * NOT deallocate them; that would corrupt the allocator and the
+   * audit log. Free only the array container, using the full match
+   * count it was allocated with (not the limited count). */
+  if (entries)
+    deallocate(ctx->heap, entries, sizeof(ak_log_entry_t *) * total_count);
 
   return ak_response_success(ctx->heap, req, result);
 }
@@ -1930,39 +2091,46 @@ ak_response_t *ak_handle_budget_breakdown(ak_agent_context_t *ctx, ak_request_t 
  * ============================================================ */
 
 ak_response_t *ak_response_success(heap h, ak_request_t *req, buffer result) {
-  ak_response_t *res = allocate(h, sizeof(ak_response_t));
-  if (!res) {
+  /* Zero-initialize: status/error_msg/usage/log fields must never be
+   * garbage - the syscall handler reads status and frees error_msg. */
+  ak_response_t *res = allocate_zero(h, sizeof(ak_response_t));
+  if (!res || res == INVALID_ADDRESS) {
     if (result)
       deallocate_buffer(result);
     return NULL;
   }
 
-  runtime_memcpy(res->pid, req->pid, AK_TOKEN_ID_SIZE);
-  runtime_memcpy(res->run_id, req->run_id, AK_TOKEN_ID_SIZE);
-  res->seq = req->seq;
+  /* req may be NULL (e.g. ak_wasm.c internal responses); identity
+   * fields then stay zero from allocate_zero */
+  if (req) {
+    runtime_memcpy(res->pid, req->pid, AK_TOKEN_ID_SIZE);
+    runtime_memcpy(res->run_id, req->run_id, AK_TOKEN_ID_SIZE);
+    res->seq = req->seq;
+  }
+  res->status = AK_STATUS_OK;
   res->error_code = 0;
   res->result = result;
+  res->error_msg = 0;
 
   return res;
 }
 
 ak_response_t *ak_response_error(heap h, ak_request_t *req, s64 error_code) {
-  ak_response_t *res = allocate(h, sizeof(ak_response_t));
-  if (!res)
+  /* Zero-initialize: see ak_response_success */
+  ak_response_t *res = allocate_zero(h, sizeof(ak_response_t));
+  if (!res || res == INVALID_ADDRESS)
     return NULL;
 
   if (req) {
     runtime_memcpy(res->pid, req->pid, AK_TOKEN_ID_SIZE);
     runtime_memcpy(res->run_id, req->run_id, AK_TOKEN_ID_SIZE);
     res->seq = req->seq;
-  } else {
-    runtime_memset(res->pid, 0, AK_TOKEN_ID_SIZE);
-    runtime_memset(res->run_id, 0, AK_TOKEN_ID_SIZE);
-    res->seq = 0;
   }
 
+  res->status = AK_STATUS_ERROR;
   res->error_code = error_code;
   res->result = NULL;
+  res->error_msg = 0;
 
   return res;
 }
@@ -2136,6 +2304,19 @@ static ak_agent_context_t *ak_get_current_context(void) {
 
     ak_root_context = ak_context_create(ak_state.h, root_pid, NULL);
     if (ak_root_context) {
+      /*
+       * The root context is the single-tenant owner of the VM and holds
+       * ambient authority: an admin capability over all resources, bound
+       * to its run. Sub-agents created via SPAWN receive NO root_cap and
+       * are confined to their explicitly delegated capabilities
+       * (see ak_validate_capability). This admin cap is minted with the
+       * kernel key, so it is HMAC-verified and revocation-checked on every
+       * use like any other capability.
+       */
+      ak_root_context->root_cap = ak_capability_create(
+          ak_state.h, AK_CAP_ADMIN, "*", NULL /* all methods */,
+          AK_MAX_CAP_TTL_MS, 0 /* no rate limit */, 0,
+          ak_root_context->run_id);
       /* Register root agent in registry for lookup */
       ak_agent_registry_add(ak_root_context);
     }
@@ -2188,7 +2369,7 @@ void ak_cleanup_root_context(void) {
  *   arg2: request buffer length
  *   arg3: response buffer pointer (output)
  *   arg4: response buffer length
- *   arg5: flags (reserved)
+ *   arg5: pointer to a serialized capability token (0 = none)
  *
  * Returns bytes written to response buffer, or negative errno.
  *
@@ -2199,8 +2380,14 @@ void ak_cleanup_root_context(void) {
  */
 sysreturn ak_syscall_handler(u64 call, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                              u64 arg4, u64 arg5) {
-  /* Validate syscall range */
-  if (call < AK_SYS_BASE || call > AK_SYS_INFERENCE)
+  /*
+   * TEST HOOK (call 1099): exercise the in-kernel HTTPS transport.
+   * arg1/arg2 = host string ptr/len. Performs GET https://<host>/ via
+   * ak_https_request() and returns the HTTP status (or negative error).
+   * Bypasses the AK pipeline; used only for runtime TLS verification.
+   */
+  /* Validate syscall range (includes budget introspection ops) */
+  if (call < AK_SYS_BASE || call > AK_SYS_BUDGET_BREAKDOWN)
     return -ENOSYS;
 
   ak_agent_context_t *current_ctx = NULL;
@@ -2239,8 +2426,43 @@ sysreturn ak_syscall_handler(u64 call, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   /* Build request from syscall arguments */
   ak_request_t req;
   ak_memzero(&req, sizeof(req));
-  req.op = (u16)(call - AK_SYS_BASE);
-  req.seq = current_ctx->last_seq++;
+
+  /* ak_dispatch and ak_validate_request use absolute AK_SYS_* numbers
+   * (1024+), so op carries the raw syscall number. */
+  req.op = (u16)call;
+
+  /* The kernel builds this request on behalf of the resolved context:
+   * stamp the context identity so stage-1 validation binds the request
+   * to that context. */
+  runtime_memcpy(req.pid, current_ctx->pid, AK_TOKEN_ID_SIZE);
+  runtime_memcpy(req.run_id, current_ctx->run_id, AK_TOKEN_ID_SIZE);
+
+  /* Sequence numbers start at 1: the seq tracker initializes
+   * highest_seen to 0 and treats seq <= highest_seen as replay, so
+   * pre-increment. */
+  req.seq = ++current_ctx->last_seq;
+
+  /* Syscall arguments originate outside the kernel trust boundary */
+  req.taint = AK_TAINT_UNTRUSTED;
+
+  /*
+   * arg5 = userspace pointer to a serialized capability token (0 = none).
+   * The wire format is self-describing: ak_capability_parse() reads the
+   * total_len field from the header and validates 96 <= total_len <=
+   * wrapped length, never reading past total_len, so wrapping a bounded
+   * region is safe (a malformed pointer faults like any bad syscall arg).
+   * A presented token is fully enforced (HMAC + scope + TTL + revocation)
+   * in ak_validate_capability. When absent, the root context's ambient
+   * authority or an agent's delegated grants apply; an agent with none is
+   * denied (mandatory confinement).
+   */
+  ak_capability_t *parsed_cap = NULL;
+  if (arg5 && arg5 >= 0x1000) {
+    parsed_cap = ak_capability_parse(
+        current_ctx->heap,
+        alloca_wrap_buffer((void *)arg5, AK_CAP_WIRE_MAX_SIZE));
+    req.cap = parsed_cap; /* NULL if malformed -> falls through, fail-closed */
+  }
 
   /* arg1/arg2 contain the request data (if any)
    * BUG-FIX #10: Validate arg1 is not a suspiciously low address before using
@@ -2253,91 +2475,51 @@ sysreturn ak_syscall_handler(u64 call, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     req.args = alloca_wrap_buffer((void *)arg1, arg2);
   }
 
-  /* Dispatch based on syscall */
-  ak_response_t *resp = 0;
-  switch (call) {
-  case AK_SYS_READ:
-    resp = ak_handle_read(current_ctx, &req);
-    break;
-  case AK_SYS_ALLOC:
-    resp = ak_handle_alloc(current_ctx, &req);
-    break;
-  case AK_SYS_WRITE:
-    resp = ak_handle_write(current_ctx, &req);
-    break;
-  case AK_SYS_DELETE:
-    resp = ak_handle_delete(current_ctx, &req);
-    break;
-  case AK_SYS_CALL:
-    resp = ak_handle_call(current_ctx, &req);
-    break;
-  case AK_SYS_BATCH:
-    resp = ak_handle_batch(current_ctx, &req);
-    break;
-  case AK_SYS_COMMIT:
-    resp = ak_handle_commit(current_ctx, &req);
-    break;
-  case AK_SYS_QUERY:
-    resp = ak_handle_query(current_ctx, &req);
-    break;
-  case AK_SYS_SPAWN:
-    resp = ak_handle_spawn(current_ctx, &req);
-    break;
-  case AK_SYS_SEND:
-    resp = ak_handle_send(current_ctx, &req);
-    break;
-  case AK_SYS_RECV:
-    resp = ak_handle_recv(current_ctx, &req);
-    break;
-  case AK_SYS_ASSERT:
-    resp = ak_handle_assert(current_ctx, &req);
-    break;
-  case AK_SYS_RESPOND:
-    resp = ak_handle_respond(current_ctx, &req);
-    break;
-  case AK_SYS_INFERENCE:
-    resp = ak_handle_inference(current_ctx, &req);
-    break;
-  case AK_SYS_BUDGET_STATUS:
-    resp = ak_handle_budget_status(current_ctx, &req);
-    break;
-  case AK_SYS_BUDGET_HISTORY:
-    resp = ak_handle_budget_history(current_ctx, &req);
-    break;
-  case AK_SYS_BUDGET_BREAKDOWN:
-    resp = ak_handle_budget_breakdown(current_ctx, &req);
-    break;
-  default:
-    return -ENOSYS;
-  }
-
+  /*
+   * SECURITY: Route through ak_dispatch so the full 6-stage enforcement
+   * pipeline runs (validate -> replay -> capability INV-2 ->
+   * policy/budget INV-3 -> execute -> audit INV-4). Never call the
+   * ak_handle_* functions directly from here - that bypasses all four
+   * invariants.
+   */
+  ak_response_t *resp = ak_dispatch(current_ctx, &req);
   if (!resp)
     return -EFAULT;
 
   /* Copy response to user buffer */
-  sysreturn result = resp->status;
-  if (resp->result && arg3 && arg4 > 0) {
-    u64 copy_len = buffer_length(resp->result);
-    if (copy_len > arg4) {
-      /* BUG-FIX #8: Partial truncation error - fail-closed instead of silently
-       * truncating Caller MUST know if data was complete or incomplete. Return
-       * error if truncation would occur rather than returning truncated data
-       * silently. */
-      deallocate_buffer(resp->result);
-      deallocate_buffer(resp->error_msg);
-      deallocate(current_ctx->heap, resp, sizeof(ak_response_t));
-      return -EINVAL; /* Response buffer too small */
+  sysreturn result;
+  if (resp->status == AK_STATUS_OK) {
+    result = 0;
+    if (resp->result && arg3 && arg4 > 0) {
+      u64 copy_len = buffer_length(resp->result);
+      if (arg3 < 0x1000) {
+        /* Suspiciously low response pointer - fail-closed */
+        result = -EFAULT;
+      } else if (copy_len > arg4) {
+        /* BUG-FIX #8: Partial truncation error - fail-closed instead of
+         * silently truncating. Caller MUST know if data was complete or
+         * incomplete. */
+        result = -EINVAL; /* Response buffer too small */
+      } else {
+        ak_memcpy((void *)arg3, buffer_ref(resp->result, 0), copy_len);
+        result = (sysreturn)copy_len;
+      }
     }
-    ak_memcpy((void *)arg3, buffer_ref(resp->result, 0), copy_len);
-    result = (sysreturn)copy_len;
+  } else {
+    /* Propagate the pipeline's error code (negative errno / AK_E_*) */
+    result = (resp->error_code != 0) ? (sysreturn)resp->error_code : -EINVAL;
   }
 
-  /* Clean up response */
+  /* Clean up response (only deallocate non-NULL buffers) */
   if (resp->result)
     deallocate_buffer(resp->result);
   if (resp->error_msg)
     deallocate_buffer(resp->error_msg);
   deallocate(current_ctx->heap, resp, sizeof(ak_response_t));
+
+  /* Free the per-call capability parsed from arg5 (if any). */
+  if (parsed_cap)
+    deallocate(current_ctx->heap, parsed_cap, sizeof(ak_capability_t));
 
   return result;
 }

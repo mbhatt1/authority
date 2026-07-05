@@ -120,8 +120,22 @@ typedef struct ak_policy {
 
   /* Metadata */
   char version[16];
+  /*
+   * Policy authentication tag.
+   *
+   * NOTE: Despite AK_SIG_SIZE being labeled "Ed25519 signature size" in
+   * ak_config.h/ak_types.h, this is NOT an Ed25519 digital signature.
+   * Only the first AK_MAC_SIZE (32) bytes are used, holding
+   * HMAC-SHA256(key, policy_hash) - symmetric authentication.  Anyone
+   * who holds the key can both create and verify tags; it provides
+   * tamper detection, not third-party-verifiable provenance.
+   */
   u8 signature[AK_SIG_SIZE];
-  u8 policy_hash[AK_HASH_SIZE]; /* SHA-256 of policy content */
+  u8 policy_hash[AK_HASH_SIZE]; /* SHA-256 of canonical serialization
+                                 * (see ak_policy_compute_hash) */
+  boolean signature_verified;   /* true only if the HMAC tag was checked
+                                 * against a configured verification key
+                                 * at load time */
   u64 created_ms;
   u64 expires_ms;
 
@@ -151,13 +165,44 @@ typedef struct ak_policy {
 void ak_policy_init(heap h);
 
 /*
- * Load policy from buffer (YAML format).
+ * Load policy from buffer (JSON format).
+ *
+ * Parses the JSON policy document produced by host tooling:
+ *
+ *   {
+ *     "version": "1.0",
+ *     "signature": "<64 or 128 hex chars, HMAC-SHA256 tag>",
+ *     "budgets": { "tokens": N, "calls": N, ... },
+ *     "tools": { "allow": ["file_read", ...], "deny": ["shell_exec"] },
+ *     "domains": { "allow": ["*.github.com"], "deny": ["*.internal"] },
+ *     "taint": { "sources": [...], "sinks": [...], "sanitizers": [...] }
+ *   }
  *
  * Returns: parsed policy on success, NULL on error.
  *
- * SECURITY: Verifies signature before returning.
+ * SECURITY (fail-closed):
+ *   - Input that is not a valid JSON policy object is REJECTED (NULL).
+ *     Nothing is silently replaced with defaults; use ak_policy_default()
+ *     if a defaults policy is wanted.
+ *   - If a verification key is configured (ak_policy_set_verification_key),
+ *     unsigned or wrongly-signed policies are REJECTED.
+ *   - If no key is configured, the policy is accepted but
+ *     policy->signature_verified stays false ("unsigned" - never treated
+ *     as verified).
+ *   - Unmatched tools/domains default to DENY.
  */
 ak_policy_t *ak_policy_load(heap h, buffer yaml_data);
+
+/*
+ * Configure the HMAC-SHA256 policy verification key (AK_KEY_SIZE bytes).
+ *
+ * Once set, ak_policy_load() rejects any policy whose HMAC tag does not
+ * verify (including unsigned policies).  Pass NULL to clear the key
+ * (subsequent loads accept policies but flag them unsigned).
+ *
+ * NOTE: symmetric authentication (HMAC-SHA256), not an Ed25519 signature.
+ */
+void ak_policy_set_verification_key(const u8 *key);
 
 /*
  * Load policy from file.
@@ -179,12 +224,17 @@ void ak_policy_get_hash(ak_policy_t *policy, u8 *hash_out);
  * ============================================================ */
 
 /*
- * Verify policy signature using HMAC-SHA256.
+ * Verify policy authentication tag using HMAC-SHA256.
+ *
+ * NOTE: This is symmetric authentication (HMAC-SHA256), NOT an Ed25519
+ * digital signature - the "Ed25519" labeling of AK_SIG_SIZE in
+ * ak_config.h/ak_types.h refers only to the field width (64 bytes).
  *
  * Signature format:
  *   - First AK_MAC_SIZE (32) bytes of policy->signature contain
  *     HMAC-SHA256(signing_key, policy_hash)
- *   - policy_hash is SHA-256 of the policy content
+ *   - policy_hash is SHA-256 of the canonical policy serialization
+ *     (ak_policy_serialize), which covers all security-relevant fields
  *
  * Behavior by configuration:
  *   - AK_ALLOW_UNSIGNED_POLICIES=0 (default, production):
@@ -442,12 +492,23 @@ s64 ak_policy_evaluate(ak_policy_t *policy, ak_budget_tracker_t *budget,
  * ============================================================ */
 
 /*
- * Serialize policy to YAML.
+ * Serialize policy to canonical YAML-style text.
+ *
+ * Deterministically emits ALL security-relevant fields: version,
+ * expiration, default allow flags, every budget limit, and all
+ * tool/domain/taint rules.  The signature itself is excluded.
+ *
+ * SECURITY: ak_policy_compute_hash() hashes this output, so any field
+ * that affects enforcement MUST be emitted here - otherwise two
+ * different policies could hash (and therefore sign) identically.
  */
 buffer ak_policy_serialize(heap h, ak_policy_t *policy);
 
 /*
  * Compute policy hash (for signing/verification).
+ *
+ * hash_out = SHA-256(ak_policy_serialize(policy)); binds the entire
+ * policy content (budgets, tools, domains, taint, defaults).
  */
 void ak_policy_compute_hash(ak_policy_t *policy, u8 *hash_out);
 

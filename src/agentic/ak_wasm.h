@@ -257,8 +257,11 @@ ak_wasm_module_load_verified(heap h, const char *name, buffer bytecode,
 /*
  * Load module from network URL.
  *
- * SECURITY: URL must match trusted patterns.
- * Requires AK_CAP_NET capability for the URL.
+ * NOT SUPPORTED: There is no in-kernel HTTP client, so network fetch of
+ * AK_WASM_SOURCE_NETWORK modules cannot be performed. The AK_CAP_NET
+ * capability is still validated for the URL, but this function ALWAYS
+ * returns NULL (fail-closed). Modules must be loaded from local bytecode
+ * via ak_wasm_module_load()/ak_wasm_module_load_verified().
  */
 ak_wasm_module_t *ak_wasm_module_fetch(heap h, const char *name,
                                        const char *url,
@@ -339,6 +342,21 @@ ak_wasm_exec_ctx_t *ak_wasm_exec_create(heap h, ak_agent_context_t *agent,
 
 /*
  * Run execution to completion.
+ *
+ * SUBSTRATE: the kernel is compiled -mno-sse (no hardware float, no
+ * soft-float runtime) and no full WASM interpreter is linked in, so a
+ * complete WASM interpreter (which the spec's mandatory f32/f64 types
+ * require) cannot run here. This executes a strict, bounded, INTEGER-ONLY
+ * WASM subset via ak_wasm_interp_run() (see ak_wasm_interp.h):
+ *   - Modules that declare/use float types or opcodes, or anything outside
+ *     the supported integer subset, are REJECTED fail-closed
+ *     (AK_E_WASM_UNSUPPORTED) - never mis-executed.
+ *   - A validating, integer-only module is genuinely interpreted; on real
+ *     completion the context is marked COMPLETED with real output and
+ *     executions_success is incremented.
+ *   - Validation failure, trap, gas exhaustion and OOM fail closed with an
+ *     honest error code (AK_E_WASM_*) and the matching failure counter;
+ *     output is never fabricated.
  */
 s64 ak_wasm_exec_run(ak_wasm_exec_ctx_t *ctx, buffer input);
 
@@ -357,6 +375,12 @@ void ak_wasm_exec_destroy(heap h, ak_wasm_exec_ctx_t *ctx);
  * Called by host functions that need to perform async operations
  * (e.g., network I/O, approval requests).
  *
+ * LIMITATION: This does NOT save real WASM machine state (PC, stack,
+ * locals) - that state lives in the userspace supervisor. The kernel
+ * only records the suspension reason and checkpoints the opaque,
+ * caller-provided blob in @data. Resumption correctness depends on the
+ * supervisor holding the actual interpreter state.
+ *
  * @param ctx         Execution context
  * @param reason      Why we're suspending
  * @param data        Data to preserve across suspension (copied)
@@ -374,6 +398,11 @@ s64 ak_wasm_exec_suspend(ak_wasm_exec_ctx_t *ctx,
  * Resume suspended execution.
  *
  * Called when async operation completes.
+ *
+ * LIMITATION: As with ak_wasm_exec_suspend(), no WASM machine state is
+ * restored here; the kernel stores the opaque result blob for the
+ * userspace supervisor to deliver into the interpreter and flips the
+ * context back to RUNNING.
  *
  * @param ctx         Execution context
  * @param result      Result data from async operation
@@ -474,6 +503,9 @@ s64 ak_host_stream_set_stop(ak_wasm_exec_ctx_t *ctx, buffer args,
 #define AK_E_WASM_TIMEOUT (-4506)
 #define AK_E_WASM_HOST_ERROR (-4507)
 #define AK_E_WASM_DEPTH_EXCEEDED (-4508)
+#define AK_E_WASM_UNSUPPORTED                                                  \
+  (-4509) /* Valid WASM, but uses features outside the integer-only subset    \
+             (float types/opcodes, unsupported opcodes/sections/imports) */
 
 /* ============================================================
  * STATISTICS

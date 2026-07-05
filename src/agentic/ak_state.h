@@ -9,15 +9,17 @@
  *   - On AK_COMMIT: Sync dirty objects to external store
  *   - On shutdown: Final sync + anchor emission
  *
- * Supports multiple backend storage systems:
- *   - S3-compatible object storage
- *   - Redis/Valkey
- *   - Custom HTTP endpoints
+ * Backend storage systems:
+ *   - VIRTIO (host-side akproxy daemon) - the only functional backend
+ *   - S3/Redis/HTTP are defined in the API but FAIL CLOSED: they require
+ *     TLS/TCP clients that are not available in the kernel
  *
  * SECURITY:
- *   - All state is encrypted at rest
- *   - Integrity verified via merkle proofs
- *   - Anchors provide tamper-evidence
+ *   - Object integrity verified via per-object hashes and merkle roots
+ *   - Anchors are hash-chained for tamper-evidence (NOT signed; no
+ *     non-repudiation)
+ *   - Encryption at rest is NOT implemented in-kernel; delegate to the
+ *     host storage daemon or backing store if required
  */
 
 #ifndef AK_STATE_H
@@ -127,16 +129,25 @@ typedef struct ak_state_snapshot {
 /* ============================================================
  * ANCHOR EMISSION
  * ============================================================
- * Anchors provide external proof of state integrity.
+ * Anchors provide tamper-evidence via hash chaining (prev_anchor)
+ * and anchoring to the audit log (log_root).
+ *
+ * HONESTY NOTES:
+ *   - heap_root is a merkle root computed over the objects that were
+ *     DIRTY at emission time (a delta commitment). It is NOT a
+ *     commitment to the full heap state; the kernel has no full-heap
+ *     enumeration API. After a fully clean sync it is all zeros.
+ *   - signature is all zeros: anchor signing is not implemented, so
+ *     anchors do NOT provide non-repudiation.
  */
 
 typedef struct ak_state_anchor {
   u64 timestamp_ms;
   u64 sequence;
-  u8 heap_root[AK_HASH_SIZE];
+  u8 heap_root[AK_HASH_SIZE]; /* Merkle root of dirty set at emission (delta) */
   u8 log_root[AK_HASH_SIZE];
   u8 prev_anchor[AK_HASH_SIZE];
-  u8 signature[64]; /* Ed25519 signature */
+  u8 signature[64]; /* All zeros - Ed25519 signing not implemented */
 } ak_state_anchor_t;
 
 /* ============================================================
@@ -148,7 +159,9 @@ typedef enum ak_sync_status {
   AK_SYNC_IN_PROGRESS = 1,
   AK_SYNC_COMPLETED = 2,
   AK_SYNC_FAILED = 3,
-  AK_SYNC_PARTIAL = 4, /* Some objects synced */
+  AK_SYNC_PARTIAL = 4,    /* Some objects synced */
+  AK_SYNC_NO_BACKEND = 5, /* No backend configured: state is in-memory
+                             only and was NOT durably persisted */
 } ak_sync_status_t;
 
 typedef struct ak_sync_result {
@@ -255,6 +268,13 @@ u64 *ak_state_get_dirty_list(u32 *count_out);
  *   - AK_SYS_COMMIT handler
  *   - Periodic sync timer
  *   - Shutdown sequence
+ *
+ * Status semantics (truthful reporting):
+ *   AK_SYNC_COMPLETED  - every dirty object was persisted by the backend
+ *   AK_SYNC_PARTIAL    - some objects persisted; failures remain dirty
+ *   AK_SYNC_FAILED     - nothing persisted; all objects remain dirty
+ *   AK_SYNC_NO_BACKEND - no backend configured; NOTHING was persisted
+ * Objects are only marked clean after the backend acknowledged them.
  */
 ak_sync_result_t ak_state_sync(void);
 
@@ -306,15 +326,23 @@ boolean ak_state_verify_anchor_chain(void);
  * BACKEND OPERATIONS
  * ============================================================
  * Low-level storage operations.
+ *
+ * Only the VIRTIO backend (host-side akproxy daemon) is functional.
+ * S3/Redis/HTTP backends FAIL CLOSED: puts/deletes return
+ * AK_E_STATE_BACKEND_ERROR and get/list return empty, so no operation
+ * ever reports success without actual persistence.
  */
 
 /*
  * Store object to backend.
+ * Returns 0 only if the backend acknowledged the write.
  */
 s64 ak_backend_put(u64 ptr, buffer value, u8 *hash);
 
 /*
  * Retrieve object from backend.
+ * Returns 0 (NULL) if not found, backend unavailable, or the stored
+ * record fails integrity verification.
  */
 buffer ak_backend_get(u64 ptr);
 
@@ -488,13 +516,17 @@ s64 ak_state_set_file_path(const char *path);
 const char *ak_state_get_file_path(void);
 
 /*
- * Verify state file integrity without loading.
+ * SHALLOW verification of a state file header (magic and version only).
+ *
+ * This does NOT verify the merkle root or per-object hashes; full
+ * integrity verification is performed by ak_state_load_from_disk(),
+ * which fails closed on any hash or merkle mismatch.
  *
  * Parameters:
  *   path - Path to state file
  *
  * Returns:
- *   0 if valid, negative error code if corrupt
+ *   0 if the header is well-formed, negative error code otherwise
  */
 s64 ak_state_verify_file(const char *path);
 

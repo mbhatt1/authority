@@ -10,6 +10,7 @@
 
 #include "ak_budget.h"
 #include "ak_assert.h"
+#include "ak_policy.h"
 #include <runtime.h>
 
 /* Define missing macros if not already defined */
@@ -29,6 +30,25 @@
 static u64 ak_budget_timestamp_ms(void)
 {
     return now(CLOCK_ID_MONOTONIC) / MILLION; /* Convert nanoseconds to milliseconds */
+}
+
+/*
+ * Overflow-safe limit check (INV-3, fail-closed).
+ *
+ * Returns true iff used + amount fits within limit, without the u64
+ * addition being able to wrap: a huge amount cannot make used + amount
+ * wrap below limit and slip past enforcement. Semantics:
+ *   limit == 0                   -> deny any non-zero amount
+ *   limit == AK_BUDGET_UNLIMITED -> effectively unlimited
+ *
+ * Caller must hold tracker->lock.
+ */
+static boolean ak_budget_fits(u64 used, u64 limit, u64 amount)
+{
+    if (used > limit) {
+        return false;
+    }
+    return amount <= limit - used;
 }
 
 /* Find tool index in breakdown by name */
@@ -73,6 +93,7 @@ ak_budget_tracker_t *ak_budget_tracker_init(heap h)
 
     runtime_memset((u8*)tracker, 0, sizeof(ak_budget_tracker_t));
     tracker->h = h;
+    spin_lock_init(&tracker->lock);
     tracker->start_timestamp_ms = ak_budget_timestamp_ms();
     tracker->last_update_ms = tracker->start_timestamp_ms;
     tracker->last_snapshot_ms = tracker->start_timestamp_ms;
@@ -104,15 +125,30 @@ void ak_budget_tracker_destroy(ak_budget_tracker_t *tracker)
 /* Compatibility wrapper for old API that takes policy */
 ak_budget_tracker_t *ak_budget_create(heap h, u8 *run_id, ak_policy_t *policy)
 {
+    (void)run_id;
+
     ak_budget_tracker_t *tracker = ak_budget_tracker_init(h);
     if (tracker == NULL) {
         return NULL;
     }
 
-    /* Store run_id in budget structure if policy is provided */
-    if (run_id && policy) {
-        /* Note: run_id and limits would be set from policy here */
-        /* This is a placeholder for the new architecture */
+    /* Apply per-resource limits from the policy budget block (INV-3).
+     * Policy values are applied verbatim: 0 means no budget granted
+     * (fail-closed deny), matching the documented limit semantics.
+     * Resources the policy does not cover (LLM token split, tool
+     * calls, wall time, blob/net bytes) keep the AK_DEFAULT_* limits
+     * set by ak_budget_tracker_init(). If policy is NULL, defaults
+     * apply across the board.
+     * Note: policy->budgets.spawn_count has no ak_resource_type_t
+     * counterpart and is enforced elsewhere. */
+    if (policy) {
+        tracker->budget.limits[AK_RESOURCE_TOKENS] = policy->budgets.tokens;
+        tracker->budget.limits[AK_RESOURCE_CALLS] = policy->budgets.calls;
+        tracker->budget.limits[AK_RESOURCE_INFERENCE_MS] = policy->budgets.inference_ms;
+        tracker->budget.limits[AK_RESOURCE_FILE_BYTES] = policy->budgets.file_bytes;
+        tracker->budget.limits[AK_RESOURCE_NETWORK_BYTES] = policy->budgets.network_bytes;
+        tracker->budget.limits[AK_RESOURCE_HEAP_OBJECTS] = policy->budgets.heap_objects;
+        tracker->budget.limits[AK_RESOURCE_HEAP_BYTES] = policy->budgets.heap_bytes;
     }
 
     return tracker;
@@ -124,9 +160,11 @@ void ak_budget_set_limit(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(resource < AK_RESOURCE_COUNT);
-    
+
+    spin_lock(&tracker->lock);
     tracker->budget.limits[resource] = limit;
     tracker->last_update_ms = ak_budget_timestamp_ms();
+    spin_unlock(&tracker->lock);
 }
 
 int ak_budget_consume(ak_budget_tracker_t *tracker,
@@ -135,19 +173,21 @@ int ak_budget_consume(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(resource < AK_RESOURCE_COUNT);
-    
-    u64 limit = tracker->budget.limits[resource];
-    u64 used = tracker->budget.used[resource];
-    
-    /* Check if consumption would exceed limit */
-    if (limit > 0 && used + amount > limit) {
+
+    spin_lock(&tracker->lock);
+
+    /* Atomic check-and-consume: overflow-safe, limit==0 denies */
+    if (!ak_budget_fits(tracker->budget.used[resource],
+                        tracker->budget.limits[resource], amount)) {
+        spin_unlock(&tracker->lock);
         return AK_E_BUDGET_EXCEEDED;
     }
-    
+
     /* Update consumption */
     tracker->budget.used[resource] += amount;
     tracker->last_update_ms = ak_budget_timestamp_ms();
-    
+
+    spin_unlock(&tracker->lock);
     return 0;
 }
 
@@ -158,7 +198,8 @@ void ak_budget_record_operation(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(operation != NULL);
-    
+
+    spin_lock(&tracker->lock);
     tracker->last_update_ms = ak_budget_timestamp_ms();
 
     /* Track operation-specific details */
@@ -176,6 +217,7 @@ void ak_budget_record_operation(ak_budget_tracker_t *tracker,
             tracker->breakdown.tool_calls_by_type[idx]++;
         }
     }
+    spin_unlock(&tracker->lock);
 }
 
 void ak_budget_snapshot(ak_budget_tracker_t *tracker)
@@ -183,7 +225,9 @@ void ak_budget_snapshot(ak_budget_tracker_t *tracker)
     AK_ASSERT_ARG(tracker != NULL);
     
     u64 now_ms = ak_budget_timestamp_ms();
-    
+
+    spin_lock(&tracker->lock);
+
     /* Create snapshot */
     ak_budget_snapshot_t snapshot;
     snapshot.timestamp_ms = now_ms;
@@ -201,8 +245,9 @@ void ak_budget_snapshot(ak_budget_tracker_t *tracker)
     if (tracker->snapshot_count < AK_BUDGET_HISTORY_SIZE) {
         tracker->snapshot_count++;
     }
-    
+
     tracker->last_snapshot_ms = now_ms;
+    spin_unlock(&tracker->lock);
 }
 
 void ak_budget_get_status(ak_budget_tracker_t *tracker,
@@ -212,7 +257,9 @@ void ak_budget_get_status(ak_budget_tracker_t *tracker,
     AK_ASSERT_ARG(status != NULL);
 
     runtime_memset((u8*)status, 0, sizeof(ak_budget_status_t));
-    
+
+    spin_lock(&tracker->lock);
+
     /* Token consumption (combine input and output) */
     status->tokens_used = tracker->budget.used[AK_RESOURCE_LLM_TOKENS_IN] +
                          tracker->budget.used[AK_RESOURCE_LLM_TOKENS_OUT];
@@ -235,6 +282,8 @@ void ak_budget_get_status(ak_budget_tracker_t *tracker,
                          tracker->budget.limits[AK_RESOURCE_NET_BYTES_OUT];
     
     status->last_update_ms = tracker->last_update_ms;
+
+    spin_unlock(&tracker->lock);
 }
 
 u32 ak_budget_get_history(ak_budget_tracker_t *tracker,
@@ -243,12 +292,15 @@ u32 ak_budget_get_history(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(snapshots != NULL);
-    
+
+    spin_lock(&tracker->lock);
+
     u32 count = AK_MIN(tracker->snapshot_count, max_count);
     if (count == 0) {
+        spin_unlock(&tracker->lock);
         return 0;
     }
-    
+
     /* Copy snapshots in chronological order */
     u32 start_idx;
     if (tracker->snapshot_count < AK_BUDGET_HISTORY_SIZE) {
@@ -263,7 +315,8 @@ u32 ak_budget_get_history(ak_budget_tracker_t *tracker,
         u32 idx = (start_idx + i) % AK_BUDGET_HISTORY_SIZE;
         snapshots[i] = tracker->snapshots[idx];
     }
-    
+
+    spin_unlock(&tracker->lock);
     return count;
 }
 
@@ -272,8 +325,10 @@ void ak_budget_get_breakdown(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(breakdown != NULL);
-    
+
+    spin_lock(&tracker->lock);
     runtime_memcpy(breakdown, &tracker->breakdown, sizeof(ak_budget_breakdown_t));
+    spin_unlock(&tracker->lock);
 }
 
 boolean ak_budget_is_critical(ak_budget_tracker_t *tracker,
@@ -281,28 +336,43 @@ boolean ak_budget_is_critical(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(resource < AK_RESOURCE_COUNT);
-    
+
+    spin_lock(&tracker->lock);
     u64 limit = tracker->budget.limits[resource];
-    if (limit == 0) {
-        return false; /* No limit set */
-    }
-    
     u64 used = tracker->budget.used[resource];
-    
-    /* Critical if >90% consumed */
-    return (used * 100 / limit) > 90;
+    spin_unlock(&tracker->lock);
+
+    if (limit == 0) {
+        return true; /* No budget granted - already exhausted (fail-closed) */
+    }
+
+    if (used >= limit) {
+        return true;
+    }
+
+    /* Critical if >90% consumed, i.e. less than 10% headroom left.
+     * Computed on the remainder to avoid u64 overflow of used * 100. */
+    return (limit - used) < (limit / 10);
 }
 
-double ak_budget_calc_rate(ak_budget_tracker_t *tracker,
-                           ak_resource_type_t resource)
+/*
+ * Returns the consumption rate in units per second as an INTEGER.
+ * The kernel is built -mno-sse (no floating point), so this uses
+ * fixed-point integer math: rate = delta * 1000 / time_span_ms.
+ */
+u64 ak_budget_calc_rate(ak_budget_tracker_t *tracker,
+                        ak_resource_type_t resource)
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(resource < AK_RESOURCE_COUNT);
-    
+
+    spin_lock(&tracker->lock);
+
     if (tracker->snapshot_count < 2) {
-        return 0.0; /* Need at least 2 snapshots */
+        spin_unlock(&tracker->lock);
+        return 0; /* Need at least 2 snapshots */
     }
-    
+
     /* Get oldest and newest snapshots */
     u32 oldest_idx, newest_idx;
     if (tracker->snapshot_count < AK_BUDGET_HISTORY_SIZE) {
@@ -312,18 +382,22 @@ double ak_budget_calc_rate(ak_budget_tracker_t *tracker,
         oldest_idx = tracker->snapshot_head;
         newest_idx = (tracker->snapshot_head + AK_BUDGET_HISTORY_SIZE - 1) % AK_BUDGET_HISTORY_SIZE;
     }
-    
-    ak_budget_snapshot_t *oldest = &tracker->snapshots[oldest_idx];
-    ak_budget_snapshot_t *newest = &tracker->snapshots[newest_idx];
-    
-    /* Calculate time span in seconds */
+
+    /* Copy under lock; compute after unlock */
+    ak_budget_snapshot_t oldest_snap = tracker->snapshots[oldest_idx];
+    ak_budget_snapshot_t newest_snap = tracker->snapshots[newest_idx];
+
+    spin_unlock(&tracker->lock);
+
+    ak_budget_snapshot_t *oldest = &oldest_snap;
+    ak_budget_snapshot_t *newest = &newest_snap;
+
+    /* Calculate time span in milliseconds */
     u64 time_span_ms = newest->timestamp_ms - oldest->timestamp_ms;
     if (time_span_ms == 0) {
-        return 0.0;
+        return 0;
     }
-    
-    double time_span_sec = (double)time_span_ms / 1000.0;
-    
+
     /* Calculate consumption delta based on resource type */
     u64 delta = 0;
     switch (resource) {
@@ -343,7 +417,11 @@ double ak_budget_calc_rate(ak_budget_tracker_t *tracker,
             break;
     }
     
-    return (double)delta / time_span_sec;
+    /* rate = delta / (time_span_ms/1000) = delta * 1000 / time_span_ms,
+     * computed as fixed-point integer. Guard against delta*1000 overflow. */
+    if (delta > (AK_BUDGET_UNLIMITED / 1000))
+        return (delta / time_span_ms) * 1000;
+    return (delta * 1000) / time_span_ms;
 }
 
 void ak_budget_format_json(ak_budget_tracker_t *tracker, buffer output)
@@ -400,9 +478,12 @@ void ak_budget_format_breakdown_json(ak_budget_tracker_t *tracker,
 {
     AK_ASSERT_ARG(tracker != NULL);
     AK_ASSERT_ARG(output != NULL);
-    
-    ak_budget_breakdown_t *breakdown = &tracker->breakdown;
-    
+
+    /* Copy under the tracker lock; format outside the critical section */
+    ak_budget_breakdown_t breakdown_copy;
+    ak_budget_get_breakdown(tracker, &breakdown_copy);
+    ak_budget_breakdown_t *breakdown = &breakdown_copy;
+
     bprintf(output, "{");
     
     /* Token breakdown */
@@ -446,6 +527,9 @@ void ak_budget_destroy(heap h, ak_budget_tracker_t *tracker)
 /**
  * Check if a resource budget is available.
  * Returns true if the request fits within budget limits.
+ *
+ * ADVISORY ONLY: check followed by commit is not atomic; use
+ * ak_budget_reserve() for enforced admission control.
  */
 boolean ak_budget_check(ak_budget_tracker_t *tracker, ak_resource_type_t type,
                        u64 amount)
@@ -458,15 +542,18 @@ boolean ak_budget_check(ak_budget_tracker_t *tracker, ak_resource_type_t type,
         return false;
     }
 
-    u64 used = tracker->budget.used[type];
-    u64 limit = tracker->budget.limits[type];
+    spin_lock(&tracker->lock);
+    boolean fits = ak_budget_fits(tracker->budget.used[type],
+                                  tracker->budget.limits[type], amount);
+    spin_unlock(&tracker->lock);
 
-    return (used + amount <= limit);
+    return fits;
 }
 
 /**
  * Commit a resource budget consumption.
- * Marks the resource as consumed.
+ * Marks the resource as consumed. The running total saturates instead
+ * of wrapping so a huge commit cannot reset usage to a small value.
  */
 void ak_budget_commit(ak_budget_tracker_t *tracker, ak_resource_type_t type,
                      u64 amount)
@@ -475,7 +562,59 @@ void ak_budget_commit(ak_budget_tracker_t *tracker, ak_resource_type_t type,
         return;
     }
 
+    spin_lock(&tracker->lock);
+    u64 used = tracker->budget.used[type];
+    if (amount > AK_BUDGET_UNLIMITED - used) {
+        tracker->budget.used[type] = AK_BUDGET_UNLIMITED; /* Saturate, never wrap */
+    } else {
+        tracker->budget.used[type] = used + amount;
+    }
+    tracker->last_update_ms = ak_budget_timestamp_ms();
+    spin_unlock(&tracker->lock);
+}
+
+/**
+ * Atomically reserve budget (check-and-consume in one critical section).
+ * This closes the check/commit TOCTOU window: concurrent callers cannot
+ * both pass the limit check and jointly overshoot the budget (INV-3).
+ */
+s64 ak_budget_reserve(ak_budget_tracker_t *tracker, ak_resource_type_t type,
+                      u64 amount)
+{
+    if (!tracker || type >= AK_RESOURCE_COUNT) {
+        return AK_E_BUDGET_EXCEEDED; /* Fail closed */
+    }
+
+    spin_lock(&tracker->lock);
+
+    if (!ak_budget_fits(tracker->budget.used[type],
+                        tracker->budget.limits[type], amount)) {
+        spin_unlock(&tracker->lock);
+        return AK_E_BUDGET_EXCEEDED;
+    }
+
     tracker->budget.used[type] += amount;
     tracker->last_update_ms = ak_budget_timestamp_ms();
+
+    spin_unlock(&tracker->lock);
+    return 0;
+}
+
+/**
+ * Release previously reserved budget (operation failed/cancelled).
+ * Clamps at zero; never underflows.
+ */
+void ak_budget_release(ak_budget_tracker_t *tracker, ak_resource_type_t type,
+                       u64 amount)
+{
+    if (!tracker || type >= AK_RESOURCE_COUNT) {
+        return;
+    }
+
+    spin_lock(&tracker->lock);
+    u64 used = tracker->budget.used[type];
+    tracker->budget.used[type] = (amount > used) ? 0 : used - amount;
+    tracker->last_update_ms = ak_budget_timestamp_ms();
+    spin_unlock(&tracker->lock);
 }
 
