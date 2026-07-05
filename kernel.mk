@@ -92,7 +92,7 @@ msg_sed=	SED	$@
 cmd_sed=	$(SED) -e 's/\#/%/' <$^ >$@
 
 msg_version=	VERSION	$@
-cmd_version=	$(MKDIR) $(dir $@); ( $(ECHO) "\#include <runtime.h>"; $(ECHO) "const sstring gitversion = ss_static_init(\"$(shell $(GIT) rev-parse HEAD)\");" ) >$@
+cmd_version=	$(MKDIR) $(dir $@); ( $(ECHO) "\#include <runtime.h>"; $(ECHO) "const sstring gitversion = ss_static_init(\"$(shell $(GIT) rev-parse HEAD 2>/dev/null || echo unknown)\");" ) >$@
 
 include ../../klib/klib.mk
 
@@ -114,7 +114,11 @@ ifneq ($(NANOS_TARGET_ROOT),)
 TARGET_ROOT_OPT=	-r $(NANOS_TARGET_ROOT)
 endif
 
-$(OBJDIR)/gitversion.c: $(ROOTDIR)/.git/index $(ROOTDIR)/.git/HEAD
+# Regenerate when HEAD moves in a normal clone. In a git worktree (.git is a
+# file) or an exported tarball (no .git), these wildcards are empty, so the
+# target has no prerequisites and builds once without failing on a missing
+# .git/index; cmd_version falls back to "unknown" when git is unavailable.
+$(OBJDIR)/gitversion.c: $(wildcard $(ROOTDIR)/.git/HEAD $(ROOTDIR)/.git/index)
 	$(call cmd,version)
 
 $(VDSOGEN):
