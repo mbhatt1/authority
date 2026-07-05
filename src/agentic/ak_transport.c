@@ -249,3 +249,87 @@ s64 ak_https_request(const char *host, u16 port, boolean tls,
     deallocate_buffer(resp);
   return status;
 }
+
+/* ============================================================
+ * Async request/poll API.
+ *
+ * This is the model that actually works in Nanos: ak_https_issue() issues the
+ * request WITHOUT blocking and returns immediately, so the syscall returns and
+ * the runloop drives the network stack normally (as it does for DHCP). The
+ * caller (agent) then polls ak_https_poll() with a yielding wait (e.g. a short
+ * userspace sleep) between polls. The completion fires on the runloop while the
+ * caller is not spinning. No in-kernel busy-wait, no cooperative pump.
+ * ============================================================ */
+
+/* Issue a request without waiting. Returns an opaque handle on success (which
+ * MUST later be reaped with ak_https_poll), or NULL on immediate failure. */
+void *ak_https_issue(const char *host, u16 port, boolean tls,
+                     ak_http_method method, const char *path,
+                     const ak_http_header *headers, u32 header_count,
+                     const void *req_body, u32 body_len) {
+  ak_https_transport_fn fn = ak_https_transport;
+  if (!fn || !host || !path)
+    return 0;
+
+  heap h = heap_locked(get_kernel_heaps());
+  ak_https_latch latch = allocate(h, sizeof(*latch));
+  if (latch == INVALID_ADDRESS)
+    return 0;
+
+  spin_lock_init(&latch->lock);
+  latch->h = h;
+  latch->done = false;
+  latch->abandoned = false;
+  latch->status = 0;
+  latch->response = 0;
+
+  struct ak_https_req req;
+  req.host = host;
+  req.port = port;
+  req.tls = tls;
+  req.method = method;
+  req.path = path;
+  req.headers = headers;
+  req.header_count = header_count;
+  req.body = req_body;
+  req.body_len = body_len;
+  req.completion = latch;
+
+  if (fn(&req) < 0) {
+    ak_https_latch_free(latch);
+    return 0;
+  }
+  return latch;
+}
+
+/* Poll an issued handle. Returns -EAGAIN if not yet complete (handle stays
+ * valid for a later poll); otherwise returns the HTTP status (>=0) or an error
+ * (<0), REAPS the handle (frees it), and sets *resp_out to the response buffer
+ * on success. */
+s64 ak_https_poll(void *handle, buffer *resp_out) {
+  if (resp_out)
+    *resp_out = 0;
+  ak_https_latch latch = handle;
+  if (!latch)
+    return AK_E_SCHEMA_INVALID;
+
+  memory_barrier();
+  if (!latch->done)
+    return -EAGAIN;
+
+  s64 status = latch->status;
+  buffer resp = latch->response;
+  latch->response = 0;
+  ak_https_latch_free(latch);
+
+  if (status < 0) {
+    if (resp)
+      deallocate_buffer(resp);
+    return status;
+  }
+  if (resp_out)
+    *resp_out = resp;
+  else if (resp)
+    deallocate_buffer(resp);
+  return status;
+}

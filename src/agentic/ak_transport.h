@@ -168,4 +168,14 @@ s64 ak_https_request(const char *host, u16 port, boolean tls,
                      const void *req_body, u32 body_len,
                      buffer *resp_out, u32 timeout_ms);
 
+/* Async request/poll API (works with Nanos's runloop model - see ak_transport.c).
+ * ak_https_issue() issues without blocking and returns an opaque handle (or NULL
+ * on immediate failure). ak_https_poll() returns -EAGAIN until complete, then the
+ * HTTP status (>=0) or error (<0), reaping the handle and setting *resp_out. */
+void *ak_https_issue(const char *host, u16 port, boolean tls,
+                     ak_http_method method, const char *path,
+                     const ak_http_header *headers, u32 header_count,
+                     const void *req_body, u32 body_len);
+s64 ak_https_poll(void *handle, buffer *resp_out);
+
 #endif /* AK_TRANSPORT_H */
