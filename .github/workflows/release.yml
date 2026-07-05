@@ -581,7 +581,7 @@ jobs:
           cd release-assets
 
           # Combine all individual checksums into one file
-          echo "# SHA256 Checksums for Authority Nanos v${VERSION}" > checksums.txt
+          echo "# SHA256 Checksums for Authority v${VERSION}" > checksums.txt
           echo "# Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> checksums.txt
           echo "" >> checksums.txt
 
@@ -604,7 +604,7 @@ jobs:
           LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
 
           cat > release-notes.md << 'NOTES_HEADER'
-          ## Authority Nanos v${VERSION}
+          ## Authority v${VERSION}
 
           ### Installation
 
@@ -638,7 +638,7 @@ jobs:
           ### Package Contents
 
           Each release archive contains:
-          - `kernel.img` - Authority Nanos unikernel
+          - `kernel.img` - Authority unikernel
           - `boot.img` - Bootloader (if applicable)
           - `lib/libak.so` or `lib/libak.dylib` - Authority Kernel library
           - `bin/mkfs` - Filesystem creation tool
@@ -669,7 +669,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
-          name: Authority Nanos v${{ steps.version.outputs.version }}
+          name: Authority v${{ steps.version.outputs.version }}
           body_path: release-notes.md
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'rc') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'alpha') }}
