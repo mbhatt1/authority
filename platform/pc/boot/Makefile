@@ -164,7 +164,14 @@ msg_uefi_ld=    LD	$@
 cmd_uefi_ld=    $(LD) $(LDLAGS-uefi) $(OBJS-uefi) -o $@
 
 msg_uefi_objcopy=    OBJCOPY	$(OBJDIR)/bootx64.efi
-cmd_uefi_objcopy=    $(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym  -j .rel -j .rela -j .rel.* -j .rela.* -j .rel* -j .rela* -j .reloc --target efi-app-x86_64 --subsystem=10 $< $@
+# Output an EFI application (PE32+, subsystem 10). Use -O pei-x86-64 rather than
+# the legacy --target efi-app-x86_64 alias: newer binutils (>= 2.4x, e.g. the
+# x86_64-elf-binutils Homebrew now ships on the macOS runners) dropped the
+# efi-app-* target names, so --target efi-app-x86_64 fails with "file format not
+# recognized". pei-x86-64 is the underlying target that has existed for as long
+# as PE support has, and --subsystem=10 supplies the EFI-application subsystem
+# that the efi-app alias used to set implicitly, so the emitted image is identical.
+cmd_uefi_objcopy=    $(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym  -j .rel -j .rela -j .rel.* -j .rela.* -j .rel* -j .rela* -j .reloc -O pei-x86-64 --subsystem=10 $< $@
 
 $(OBJDIR-uefi)/x86_64/uefi-crt0.o:	$(SRCDIR)/x86_64/uefi-crt0.s | $(sort $(GENHEADERS))
 	$(call cmd,uefi_as)
