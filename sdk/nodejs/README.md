@@ -367,9 +367,9 @@ Apache License 2.0
 
 ## Support
 
-- **Documentation**: [Authority Docs](https://github.com/authority-systems/nanos)
-- **Issues**: [GitHub Issues](https://github.com/authority-systems/nanos/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/authority-systems/nanos/discussions)
+- **Documentation**: [Authority Docs](https://github.com/mbhatt1/authority)
+- **Issues**: [GitHub Issues](https://github.com/mbhatt1/authority/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/mbhatt1/authority/discussions)
 
 ## Changelog
 

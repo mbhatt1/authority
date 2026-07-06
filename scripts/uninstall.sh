@@ -5,7 +5,7 @@
 # This script removes Authority Nanos from your system.
 #
 # Usage:
-#   curl -sSfL https://authority.dev/uninstall.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/uninstall.sh | sh
 #   ./scripts/uninstall.sh
 #
 # Options:
@@ -109,7 +109,7 @@ show_help() {
 Authority Nanos Uninstaller
 
 USAGE:
-    curl -sSfL https://authority.dev/uninstall.sh | sh
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/uninstall.sh | sh
     ./scripts/uninstall.sh [OPTIONS]
 
 OPTIONS:
@@ -150,7 +150,7 @@ COMPONENTS REMOVED:
 Shell profile modifications are NOT automatically removed.
 You may want to manually remove the 'source .../env.sh' line.
 
-For more information, visit: https://github.com/authority-systems/nanos
+For more information, visit: https://github.com/mbhatt1/authority
 HELPEOF
 }
 

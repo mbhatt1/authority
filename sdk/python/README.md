@@ -47,9 +47,9 @@ with AuthorityKernel() as ak:
 
 ## Documentation
 
-- [Getting Started](https://authority-systems.github.io/nanos/getting-started/)
-- [API Reference](https://authority-systems.github.io/nanos/api/)
-- [Security Model](https://authority-systems.github.io/nanos/security/)
+- [Getting Started](https://mbhatt1.github.io/authority/getting-started/)
+- [API Reference](https://mbhatt1.github.io/authority/api/)
+- [Security Model](https://mbhatt1.github.io/authority/security/)
 
 ## License
 

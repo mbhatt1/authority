@@ -130,7 +130,7 @@ response = kernel.inference(prompt="your payload", max_tokens=100)
 
 ## Learn More
 
-- [Authority Documentation](https://authority-systems.github.io/nanos)
-- [Policy Format Reference](https://authority-systems.github.io/nanos/policy/)
-- [API Reference](https://authority-systems.github.io/nanos/api/)
-- [Security Best Practices](https://authority-systems.github.io/nanos/security/)
+- [Authority Documentation](https://mbhatt1.github.io/authority)
+- [Policy Format Reference](https://mbhatt1.github.io/authority/policy/)
+- [API Reference](https://mbhatt1.github.io/authority/api/)
+- [Security Best Practices](https://mbhatt1.github.io/authority/security/)

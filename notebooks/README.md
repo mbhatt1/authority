@@ -117,7 +117,7 @@ with AuthorityKernel(simulate=False) as ak:
 
 2. **Restart the kernel if stuck**: If something goes wrong, use Kernel > Restart.
 
-3. **Check the SDK docs**: For more details, see the [documentation](https://authority-systems.github.io/nanos/).
+3. **Check the SDK docs**: For more details, see the [documentation](https://mbhatt1.github.io/authority/).
 
 4. **Experiment**: Modify the examples to explore different scenarios.
 

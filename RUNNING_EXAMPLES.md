@@ -297,7 +297,7 @@ chmod +x run_all_tests.sh
 - **Host SDK Documentation**: [Authority Python SDK](docs/guide/python-sdk.md)
 - **Kernel Documentation**: [Authority Kernel Architecture](docs/architecture/authority-kernel.html)
 - **ops Tool Docs**: [ops.city](https://ops.city/)
-- **GitHub**: [authority-systems/nanos](https://github.com/authority-systems/nanos)
+- **GitHub**: [mbhatt1/authority](https://github.com/mbhatt1/authority)
 
 ---
 
@@ -320,6 +320,6 @@ chmod +x run_all_tests.sh
 
 For issues, please check:
 1. [Troubleshooting section above](#-troubleshooting)
-2. [Authority GitHub Issues](https://github.com/authority-systems/nanos/issues)
+2. [Authority GitHub Issues](https://github.com/mbhatt1/authority/issues)
 3. [ops Tool Documentation](https://ops.city/)
 4. [Nanos Unikernel Project](https://github.com/nanovms/nanos)

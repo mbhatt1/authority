@@ -5,8 +5,8 @@
 # This script downloads and installs Authority Nanos on your system.
 #
 # Usage:
-#   curl -sSfL https://authority.dev/get.sh | sh
-#   curl -sSfL https://raw.githubusercontent.com/authority-systems/nanos/master/scripts/get.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh
 #
 # Options:
 #   --help              Show help message
@@ -31,7 +31,7 @@ set -e
 # Configuration
 # ============================================================================
 
-GITHUB_REPO="authority-systems/nanos"
+GITHUB_REPO="mbhatt1/authority"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 GITHUB_RELEASES="https://github.com/${GITHUB_REPO}/releases"
 PYPI_PACKAGE="authority-nanos"
@@ -304,9 +304,6 @@ get_download_url() {
     # Also try without 'v' prefix
     DOWNLOAD_URL_ALT="${GITHUB_RELEASES}/download/${VERSION}/${TARBALL}"
 
-    # Try Google Cloud Storage as fallback
-    GCS_URL="https://storage.googleapis.com/nanos/release/${VERSION}/${TARBALL}"
-
     log_verbose "Download URL: $DOWNLOAD_URL"
 }
 
@@ -346,14 +343,11 @@ install_binaries() {
 
     TARBALL_PATH="${TEMP_DIR}/authority-nanos.tar.gz"
 
-    # Try primary URL
+    # Try primary URL (GitHub Releases, v-prefixed tag)
     if ! download_file "$DOWNLOAD_URL" "$TARBALL_PATH" 2>/dev/null; then
-        log_verbose "Primary URL failed, trying alternative..."
+        log_verbose "Primary URL failed, trying alternative (unprefixed tag)..."
         if ! download_file "$DOWNLOAD_URL_ALT" "$TARBALL_PATH" 2>/dev/null; then
-            log_verbose "Alternative URL failed, trying GCS..."
-            if ! download_file "$GCS_URL" "$TARBALL_PATH" 2>/dev/null; then
-                die "Failed to download Authority Nanos. Check your internet connection and version number."
-            fi
+            die "Failed to download Authority Nanos. Check your internet connection and version number."
         fi
     fi
 
@@ -727,8 +721,8 @@ show_help() {
 Authority Nanos Installer
 
 USAGE:
-    curl -sSfL https://authority.dev/get.sh | sh
-    curl -sSfL https://authority.dev/get.sh | sh -s -- [OPTIONS]
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh -s -- [OPTIONS]
 
 OPTIONS:
     --help              Show this help message
@@ -746,19 +740,19 @@ ENVIRONMENT VARIABLES:
 
 EXAMPLES:
     # Install latest version
-    curl -sSfL https://authority.dev/get.sh | sh
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh
 
     # Install specific version
-    curl -sSfL https://authority.dev/get.sh | sh -s -- --version 0.1.46
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh -s -- --version 0.1.46
 
     # Install to custom directory
-    curl -sSfL https://authority.dev/get.sh | sh -s -- --prefix $HOME/.local
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh -s -- --prefix $HOME/.local
 
     # Uninstall
-    curl -sSfL https://authority.dev/get.sh | sh -s -- --uninstall
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh -s -- --uninstall
 
     # Install without Python SDK
-    curl -sSfL https://authority.dev/get.sh | sh -s -- --no-python
+    curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh -s -- --no-python
 
 SUPPORTED PLATFORMS:
     - Linux x86_64 (amd64)
@@ -773,7 +767,7 @@ COMPONENTS INSTALLED:
     - authority      - CLI tool (ops/minops)
     - Python SDK     - authority-nanos package (optional)
 
-For more information, visit: https://github.com/authority-systems/nanos
+For more information, visit: https://github.com/mbhatt1/authority
 HELPEOF
 }
 
@@ -863,8 +857,8 @@ print_next_steps() {
         printf "\n"
     fi
 
-    printf "%bDocumentation:%b https://github.com/authority-systems/nanos\n" "$BOLD" "$NC"
-    printf "%bSupport:%b       https://github.com/authority-systems/nanos/issues\n" "$BOLD" "$NC"
+    printf "%bDocumentation:%b https://github.com/mbhatt1/authority\n" "$BOLD" "$NC"
+    printf "%bSupport:%b       https://github.com/mbhatt1/authority/issues\n" "$BOLD" "$NC"
     printf "\n"
 }
 

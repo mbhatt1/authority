@@ -64,7 +64,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/authority-systems/nanos.git",
+    "url": "https://github.com/mbhatt1/authority.git",
     "directory": "sdk/nodejs"
   }
 }

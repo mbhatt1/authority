@@ -40,7 +40,7 @@ flowchart LR
 
 Before you begin, ensure you have:
 
-- [authority CLI](https://authority.dev) installed
+- [authority CLI](https://github.com/mbhatt1/authority) installed
 - A compiled application (Go, Rust, C, etc.)
 - Basic familiarity with unikernels
 

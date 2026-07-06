@@ -307,7 +307,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         print("  Run tests: pytest tests/")
         print()
 
-    print("Documentation: https://authority-systems.github.io/nanos")
+    print("Documentation: https://mbhatt1.github.io/authority")
 
     return 0
 
@@ -913,7 +913,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="authority-nanos",
         description="Authority Nanos Command Line Interface",
-        epilog="For more information, see: https://authority-systems.github.io/nanos"
+        epilog="For more information, see: https://mbhatt1.github.io/authority"
     )
 
     parser.add_argument(

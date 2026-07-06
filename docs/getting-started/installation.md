@@ -9,7 +9,7 @@ Authority provides the cryptographic authorization, deny-by-default policy, and 
 ```mermaid
 flowchart TB
     subgraph "Option 1: authority CLI (Recommended)"
-        OPS_CURL[curl authority.dev/get.sh]
+        OPS_CURL[curl raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh]
         OPS_INSTALL[authority installed]
         OPS_READY[Ready to build images]
 
@@ -34,7 +34,7 @@ flowchart TB
 The fastest way to get started with Authority is using the `authority` CLI:
 
 ```bash
-curl https://authority.dev/get.sh -sSfL | sh
+curl https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh -sSfL | sh
 ```
 
 This installs both the authority CLI and the Authority kernel.
@@ -54,7 +54,7 @@ brew update && brew install go wget ent qemu aarch64-elf-binutils
 ```bash
 sudo apt-get update
 sudo apt-get install qemu-system-x86 nasm golang-go ent ruby build-essential
-curl https://authority.dev/get.sh -sSfL | sh
+curl https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh -sSfL | sh
 ```
 
 ### Build the Kernel

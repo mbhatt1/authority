@@ -1001,7 +1001,7 @@ cmd_new() {
             ;;
     esac
 
-    echo "Documentation: https://authority-systems.github.io/nanos"
+    echo "Documentation: https://mbhatt1.github.io/authority"
 }
 
 # Command: version
@@ -1057,7 +1057,7 @@ cmd_help() {
     echo "  authority policy validate policy.json"
     echo "  authority run ./my-app"
     echo ""
-    echo "For more information, see: https://authority-systems.github.io/nanos"
+    echo "For more information, see: https://mbhatt1.github.io/authority"
 }
 
 # Main entry point

@@ -74,7 +74,7 @@ CrewAI Integration:
         result = crew.kickoff()
         print(result.raw)
 
-For more details, see the documentation at https://authority-systems.github.io/nanos/python
+For more details, see the documentation at https://mbhatt1.github.io/authority/python
 """
 
 from authority_nanos.core import (

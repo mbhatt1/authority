@@ -139,7 +139,7 @@ Capabilities are **unforgeable HMAC-SHA256 signed tokens** granting specific per
 
 ### How do I deploy to cloud providers?
 
-Use the [authority CLI](https://authority.dev), which supports AWS, GCP, Azure, DigitalOcean, Vultr, and more.
+Use the [authority CLI](https://github.com/mbhatt1/authority), which supports AWS, GCP, Azure, DigitalOcean, Vultr, and more.
 
 ### Can I run on edge devices?
 

@@ -610,7 +610,7 @@ jobs:
 
           #### Quick Install (recommended)
           ```bash
-          curl -sSfL https://authority.dev/get.sh | sh
+          curl -sSfL https://raw.githubusercontent.com/mbhatt1/authority/master/scripts/get.sh | sh
           ```
 
           #### Manual Download

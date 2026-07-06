@@ -34,6 +34,6 @@ The policy file (`policy.json`) defines what the program is allowed to do:
 
 ## Learn More
 
-- [Authority Documentation](https://authority-systems.github.io/nanos)
-- [Policy Format Reference](https://authority-systems.github.io/nanos/policy/)
-- [API Reference](https://authority-systems.github.io/nanos/api/)
+- [Authority Documentation](https://mbhatt1.github.io/authority)
+- [Policy Format Reference](https://mbhatt1.github.io/authority/policy/)
+- [API Reference](https://mbhatt1.github.io/authority/api/)
