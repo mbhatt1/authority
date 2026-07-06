@@ -13,4 +13,4 @@ This document tracks large features on the engineering roadmap. This is not an a
 
 ## Feature Development
 
-For the latest development work and active issues, see the [GitHub repository](https://github.com/nanovms/authority-nanos).
+For the latest development work and active issues, see the [GitHub repository](https://github.com/mbhatt1/authority).

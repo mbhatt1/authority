@@ -7,8 +7,16 @@ export default withMermaid(defineConfig({
   description: 'Capability-based security unikernel: cryptographic capabilities, tamper-evident audit, and resource budgets',
   lang: 'en-US',
 
+  // Deployed to GitHub Project Pages at https://mbhatt1.github.io/authority/.
+  // Without this base, VitePress emits root-absolute asset URLs (/assets/...,
+  // /vp-icons.css) that 404 under the /authority/ subpath, leaving the site
+  // completely unstyled. Must match the repo name and keep the trailing slash.
+  base: '/authority/',
+
   head: [
-    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' }],
+    // Raw <head> entries are emitted verbatim (base is NOT auto-prepended),
+    // so the favicon path must include the base explicitly.
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/authority/favicon.svg' }],
     ['meta', { charset: 'utf-8' }],
     ['meta', { name: 'viewport', content: 'width=device-width, initial-scale=1.0' }],
     ['meta', { name: 'theme-color', content: '#dc2626' }],
@@ -16,7 +24,7 @@ export default withMermaid(defineConfig({
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'Authority' }],
     ['meta', { property: 'og:description', content: 'Capability-based security unikernel' }],
-    ['meta', { property: 'og:url', content: 'https://authority-nanos.dev' }],
+    ['meta', { property: 'og:url', content: 'https://mbhatt1.github.io/authority/' }],
 
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:title', content: 'Authority' }],
@@ -189,7 +197,7 @@ export default withMermaid(defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/nanovms/authority-nanos' }
+      { icon: 'github', link: 'https://github.com/mbhatt1/authority' }
     ],
 
     footer: {
@@ -202,7 +210,7 @@ export default withMermaid(defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/nanovms/authority-nanos/edit/master/docs/:path',
+      pattern: 'https://github.com/mbhatt1/authority/edit/master/docs/:path',
       text: 'Edit on GitHub'
     }
   },

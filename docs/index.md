@@ -1,5 +1,6 @@
 ---
 layout: home
+titleTemplate: false
 
 hero:
   name: Authority
@@ -11,7 +12,7 @@ hero:
       link: /getting-started/
     - theme: alt
       text: View on GitHub
-      link: https://github.com/nanovms/authority-nanos
+      link: https://github.com/mbhatt1/authority
 
 features:
   - title: Cryptographic Capabilities

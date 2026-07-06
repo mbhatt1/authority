@@ -61,7 +61,7 @@ curl https://authority.dev/get.sh -sSfL | sh
 
 ```bash
 # Clone the repository
-git clone https://github.com/nanovms/authority-nanos.git
+git clone https://github.com/mbhatt1/authority.git
 cd authority-nanos/nanos
 
 # Build the kernel for x86_64 (Authority kernel enabled by default)

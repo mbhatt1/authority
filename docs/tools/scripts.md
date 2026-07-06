@@ -93,7 +93,7 @@ make PLATFORM=pc
 
 Release process steps:
 
-1. Create [GitHub release](https://github.com/nanovms/authority-nanos/releases)
+1. Create [GitHub release](https://github.com/mbhatt1/authority/releases)
 2. Build on both Linux and macOS
 3. Update version files
 4. Run release script:

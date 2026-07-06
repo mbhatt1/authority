@@ -4,7 +4,7 @@
 
 To release a new version of Nanos:
 
-1. Create a [GitHub release](https://github.com/nanovms/authority-nanos/releases)
+1. Create a [GitHub release](https://github.com/mbhatt1/authority/releases)
 2. Build the source on both Linux and macOS
 3. Run the release script:
    ```bash
@@ -39,4 +39,4 @@ The `-f` flag forces fetching the latest version.
 
 ## Release Channels
 
-Releases are published on GitHub. Check the [Releases page](https://github.com/nanovms/authority-nanos/releases) for the latest versions.
+Releases are published on GitHub. Check the [Releases page](https://github.com/mbhatt1/authority/releases) for the latest versions.

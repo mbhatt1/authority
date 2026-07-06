@@ -154,7 +154,7 @@ Use the [authority CLI](https://authority.dev), which supports AWS, GCP, Azure, 
 
 ```bash
 # Clone
-git clone https://github.com/nanovms/authority-nanos.git
+git clone https://github.com/mbhatt1/authority.git
 cd authority-nanos/nanos
 
 # Build for x86_64
@@ -172,7 +172,7 @@ make PLATFORM=virt ARCH=aarch64 CROSS_COMPILE=aarch64-elf- kernel
 
 ### Can I contribute?
 
-**Yes!** See [CONTRIBUTING.md](https://github.com/nanovms/authority-nanos/blob/main/nanos/CONTRIBUTING.md).
+**Yes!** See [CONTRIBUTING.md](https://github.com/mbhatt1/authority/blob/master/CONTRIBUTING.md).
 
 Priority areas:
 - Security (policy language, formal verification)
@@ -194,7 +194,7 @@ Priority areas:
 
 **Community Support** (free):
 - [Discussion Forum](https://forums.nanovms.com/)
-- [GitHub Issues](https://github.com/nanovms/authority-nanos/issues)
+- [GitHub Issues](https://github.com/mbhatt1/authority/issues)
 
 **Commercial Support** (paid):
 - 24/7 security incident response
