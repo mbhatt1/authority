@@ -79,16 +79,19 @@ print_banner() {
     printf "\n"
 }
 
+# All logs go to stderr so that functions which "return" a value via stdout
+# (e.g. get_latest_version) are not contaminated by log lines when captured in
+# a command substitution like VERSION=$(get_latest_version).
 log_info() {
-    printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$1"
+    printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$1" >&2
 }
 
 log_success() {
-    printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$1"
+    printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$1" >&2
 }
 
 log_warn() {
-    printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"
+    printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1" >&2
 }
 
 log_error() {
@@ -97,7 +100,7 @@ log_error() {
 
 log_verbose() {
     if [ "$VERBOSE" = "1" ]; then
-        printf "%b[DEBUG]%b %s\n" "$CYAN" "$NC" "$1"
+        printf "%b[DEBUG]%b %s\n" "$CYAN" "$NC" "$1" >&2
     fi
 }
 
@@ -219,10 +222,10 @@ get_latest_version() {
     # Try GitHub API first
     if [ "$DOWNLOADER" = "curl" ]; then
         LATEST_VERSION=$(curl -fsSL "${GITHUB_API}/releases/latest" 2>/dev/null | \
-            grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/' | sed 's/^v//')
+            grep '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' | sed 's/^v//')
     else
         LATEST_VERSION=$(wget -qO- "${GITHUB_API}/releases/latest" 2>/dev/null | \
-            grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/' | sed 's/^v//')
+            grep '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' | sed 's/^v//')
     fi
 
     if [ -z "$LATEST_VERSION" ]; then
@@ -278,21 +281,23 @@ download_file() {
 }
 
 get_download_url() {
-    # Construct release artifact URL
-    # Format: nanos-release-{os}-{version}[-{platform}].tar.gz
-
+    # Construct the release artifact URL. Asset names are produced by
+    # .github/workflows/release.yml and have the form:
+    #   authority-nanos-{version}-{os}-{arch}.tar.gz
+    # where {os} is linux|darwin and {arch} is x86_64|arm64. Note the release
+    # uses x86_64 (not the amd64 that detect_platform normalises to).
     case "$PLATFORM" in
         linux-amd64)
-            TARBALL="nanos-release-linux-${VERSION}.tar.gz"
+            TARBALL="authority-nanos-${VERSION}-linux-x86_64.tar.gz"
             ;;
         linux-arm64)
-            TARBALL="nanos-release-linux-${VERSION}-virt.tar.gz"
+            TARBALL="authority-nanos-${VERSION}-linux-arm64.tar.gz"
             ;;
         darwin-amd64)
-            TARBALL="nanos-release-darwin-${VERSION}.tar.gz"
+            TARBALL="authority-nanos-${VERSION}-darwin-x86_64.tar.gz"
             ;;
         darwin-arm64)
-            TARBALL="nanos-release-darwin-${VERSION}-virt.tar.gz"
+            TARBALL="authority-nanos-${VERSION}-darwin-arm64.tar.gz"
             ;;
         *)
             die "No pre-built binary available for platform: $PLATFORM"
@@ -356,6 +361,19 @@ install_binaries() {
     # Extract tarball
     tar -xzf "$TARBALL_PATH" -C "$TEMP_DIR" || die "Failed to extract tarball"
 
+    # The release tarball (see .github/workflows/release.yml) packs everything
+    # under a single versioned top-level directory, e.g.
+    #   authority-nanos-2.0.1-darwin-arm64/{kernel.img,lib/,bin/,...}
+    # That directory name is exactly the tarball stem. Descend into it so the
+    # copies below find the payload; fall back to a flat layout just in case.
+    SRC_DIR="${TEMP_DIR}/${TARBALL%.tar.gz}"
+    if [ ! -d "$SRC_DIR" ]; then
+        # Fall back to the sole extracted directory, else the temp root.
+        SRC_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        [ -n "$SRC_DIR" ] && [ -d "$SRC_DIR" ] || SRC_DIR="$TEMP_DIR"
+    fi
+    log_verbose "Install source dir: $SRC_DIR"
+
     # Find and install kernel and bootloader
     INSTALL_NEEDS_SUDO=0
 
@@ -364,54 +382,50 @@ install_binaries() {
         INSTALL_NEEDS_SUDO=1
     fi
 
-    # Install kernel.img
-    if [ -f "${TEMP_DIR}/kernel.img" ]; then
-        log_verbose "Installing kernel.img to ${INSTALL_LIB}/"
+    # Copy a file with the right privilege level (used for all payload files).
+    install_cp() {
+        _src="$1"; _dst="$2"
         if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-            sudo cp "${TEMP_DIR}/kernel.img" "${INSTALL_LIB}/"
+            sudo cp "$_src" "$_dst"
         else
-            cp "${TEMP_DIR}/kernel.img" "${INSTALL_LIB}/"
+            cp "$_src" "$_dst"
         fi
+    }
+
+    INSTALLED_ANY=0
+
+    # Install kernel.img
+    if [ -f "${SRC_DIR}/kernel.img" ]; then
+        log_verbose "Installing kernel.img to ${INSTALL_LIB}/"
+        install_cp "${SRC_DIR}/kernel.img" "${INSTALL_LIB}/"
+        INSTALLED_ANY=1
     fi
 
     # Install boot.img
-    if [ -f "${TEMP_DIR}/boot.img" ]; then
+    if [ -f "${SRC_DIR}/boot.img" ]; then
         log_verbose "Installing boot.img to ${INSTALL_LIB}/"
-        if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-            sudo cp "${TEMP_DIR}/boot.img" "${INSTALL_LIB}/"
-        else
-            cp "${TEMP_DIR}/boot.img" "${INSTALL_LIB}/"
-        fi
+        install_cp "${SRC_DIR}/boot.img" "${INSTALL_LIB}/"
     fi
 
     # Install libak (shared library)
-    if [ -f "${TEMP_DIR}/lib/libak.so" ]; then
+    if [ -f "${SRC_DIR}/lib/libak.so" ]; then
         log_verbose "Installing libak.so to ${INSTALL_LIB}/"
-        if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-            sudo cp "${TEMP_DIR}/lib/libak.so" "${INSTALL_LIB}/"
-        else
-            cp "${TEMP_DIR}/lib/libak.so" "${INSTALL_LIB}/"
-        fi
-    elif [ -f "${TEMP_DIR}/lib/libak.dylib" ]; then
+        install_cp "${SRC_DIR}/lib/libak.so" "${INSTALL_LIB}/"
+    elif [ -f "${SRC_DIR}/lib/libak.dylib" ]; then
         log_verbose "Installing libak.dylib to ${INSTALL_LIB}/"
-        if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-            sudo cp "${TEMP_DIR}/lib/libak.dylib" "${INSTALL_LIB}/"
-        else
-            cp "${TEMP_DIR}/lib/libak.dylib" "${INSTALL_LIB}/"
-        fi
+        install_cp "${SRC_DIR}/lib/libak.dylib" "${INSTALL_LIB}/"
     fi
 
     # Install any additional tools found
-    if [ -d "${TEMP_DIR}/bin" ]; then
-        for TOOL in "${TEMP_DIR}/bin"/*; do
+    if [ -d "${SRC_DIR}/bin" ]; then
+        for TOOL in "${SRC_DIR}/bin"/*; do
             if [ -f "$TOOL" ] && [ -x "$TOOL" ]; then
                 TOOL_NAME=$(basename "$TOOL")
                 log_verbose "Installing $TOOL_NAME to ${INSTALL_BIN}/"
+                install_cp "$TOOL" "${INSTALL_BIN}/"
                 if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-                    sudo cp "$TOOL" "${INSTALL_BIN}/"
                     sudo chmod +x "${INSTALL_BIN}/${TOOL_NAME}"
                 else
-                    cp "$TOOL" "${INSTALL_BIN}/"
                     chmod +x "${INSTALL_BIN}/${TOOL_NAME}"
                 fi
             fi
@@ -420,17 +434,20 @@ install_binaries() {
 
     # Install minops/ops tool if present
     for TOOL in ops minops authority; do
-        if [ -f "${TEMP_DIR}/${TOOL}" ]; then
+        if [ -f "${SRC_DIR}/${TOOL}" ]; then
             log_verbose "Installing $TOOL to ${INSTALL_BIN}/"
+            install_cp "${SRC_DIR}/${TOOL}" "${INSTALL_BIN}/"
             if [ "$INSTALL_NEEDS_SUDO" = "1" ]; then
-                sudo cp "${TEMP_DIR}/${TOOL}" "${INSTALL_BIN}/"
                 sudo chmod +x "${INSTALL_BIN}/${TOOL}"
             else
-                cp "${TEMP_DIR}/${TOOL}" "${INSTALL_BIN}/"
                 chmod +x "${INSTALL_BIN}/${TOOL}"
             fi
         fi
     done
+
+    if [ "$INSTALLED_ANY" = "0" ]; then
+        die "Downloaded archive did not contain kernel.img (looked in ${SRC_DIR}). The release asset layout may have changed."
+    fi
 
     log_success "Binaries installed"
 }
@@ -525,10 +542,11 @@ case "$(uname -s)" in
 esac
 ENVEOF
 
-    # Customize for actual install prefix
-    sed -i.bak "s|/usr/local|${PREFIX}|g" "${TEMP_DIR}/env.sh" 2>/dev/null || \
-        sed "s|/usr/local|${PREFIX}|g" "${TEMP_DIR}/env.sh" > "${TEMP_DIR}/env.sh.new" && \
-        mv "${TEMP_DIR}/env.sh.new" "${TEMP_DIR}/env.sh"
+    # Customize for actual install prefix. Write to a temp file and move it into
+    # place: this avoids the sed -i portability difference between GNU (-i) and
+    # BSD/macOS (-i '') sed entirely.
+    sed "s|/usr/local|${PREFIX}|g" "${TEMP_DIR}/env.sh" > "${TEMP_DIR}/env.sh.new"
+    mv "${TEMP_DIR}/env.sh.new" "${TEMP_DIR}/env.sh"
 
     # Install env.sh
     if [ -w "$INSTALL_SHARE" ]; then
