@@ -617,6 +617,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+    # Surface the secret as a job-level env so the publish step can be gated on
+    # its presence (the `secrets` context is not available in a step `if:`).
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -661,6 +665,7 @@ jobs:
           echo "Detected version: $VERSION"
 
       - name: Publish to PyPI (production)
+        if: env.PYPI_API_TOKEN != ''
         run: |
           python -m twine upload dist/*.whl \
             --non-interactive \
@@ -668,54 +673,15 @@ jobs:
         env:
           TWINE_REPOSITORY: pypi
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_PASSWORD: ${{ env.PYPI_API_TOKEN }}
 
-  # ============================================================================
-  # Create Release
-  # ============================================================================
-  create-release:
-    name: 📦 Create Release
-    needs: [build-macos-x86, build-macos-arm64, build-linux-x86, build-linux-arm64, build-linux-riscv64, publish-wheels-pypi]
-    if: startsWith(github.ref, 'refs/tags/v') && !failure()
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Display artifact structure
+      - name: Skip publish (no token)
+        if: env.PYPI_API_TOKEN == ''
         run: |
-          find artifacts -type f
-          echo "---"
-          find artifacts -type f -exec ls -lh {} \;
+          echo "PYPI_API_TOKEN secret is not set — skipping the PyPI upload."
+          echo "Wheels were built and validated above. To publish, add a PyPI"
+          echo "API token as the repository secret PYPI_API_TOKEN and re-run."
 
-      - name: Create checksums
-        run: |
-          mkdir -p checksums
-          find artifacts -name "*.sha256" -o -name "*.sha256sum" | while read f; do cp "$f" checksums/; done
-          cd checksums && cat *.sha256 *.sha256sum > SHA256SUMS 2>/dev/null || true
-          cd ..
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/authority-nanos-macos-x86_64/authority-nanos-macos-x86_64.tar.gz
-            artifacts/authority-nanos-macos-x86_64/authority-nanos-macos-x86_64.tar.gz.sha256
-            artifacts/authority-nanos-macos-arm64/authority-nanos-macos-arm64.tar.gz
-            artifacts/authority-nanos-macos-arm64/authority-nanos-macos-arm64.tar.gz.sha256
-            artifacts/authority-nanos-linux-x86_64/authority-nanos-linux-x86_64.tar.gz
-            artifacts/authority-nanos-linux-x86_64/authority-nanos-linux-x86_64.tar.gz.sha256
-            artifacts/authority-nanos-linux-deb/authority-nanos-amd64.deb
-            artifacts/authority-nanos-linux-arm64/authority-nanos-linux-arm64.tar.gz
-            artifacts/authority-nanos-linux-arm64/authority-nanos-linux-arm64.tar.gz.sha256
-            artifacts/authority-nanos-linux-riscv64/authority-nanos-linux-riscv64.tar.gz
-            artifacts/authority-nanos-linux-riscv64/authority-nanos-linux-riscv64.tar.gz.sha256
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # GitHub Release creation lives in release.yml (softprops/action-gh-release),
+  # which is the single owner of releases on v* tags. This workflow only builds
+  # the platform artifacts and (optionally) publishes wheels to PyPI.
