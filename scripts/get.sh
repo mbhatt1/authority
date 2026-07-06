@@ -460,6 +460,8 @@ install_python_sdk() {
 
     log_info "Installing Python SDK..."
 
+    SDK_INSTALLED=0
+
     # Preferred: install from the SDK bundled in the release tarball we already
     # downloaded and extracted (SRC_DIR is set by install_binaries). This needs
     # no network and no git, so it avoids the slow full-history git clone /
@@ -467,38 +469,66 @@ install_python_sdk() {
     if [ -n "${SRC_DIR:-}" ] && [ -d "${SRC_DIR}/sdk-python" ]; then
         if $PIP_CMD install "${SRC_DIR}/sdk-python" >/dev/null 2>&1; then
             log_success "Python SDK installed from release bundle"
-            return 0
+            SDK_INSTALLED=1
+        else
+            log_verbose "Bundled SDK install failed, falling back to PyPI/GitHub"
         fi
-        log_verbose "Bundled SDK install failed, falling back to PyPI/GitHub"
     fi
 
     # Next: try PyPI (only works once the package is actually published there).
-    if $PIP_CMD install --upgrade "${PYPI_PACKAGE}" >/dev/null 2>&1; then
+    if [ "$SDK_INSTALLED" = "0" ] && $PIP_CMD install --upgrade "${PYPI_PACKAGE}" >/dev/null 2>&1; then
         log_success "Python SDK installed from PyPI"
-        return 0
+        SDK_INSTALLED=1
     fi
 
     # Last resort: install from GitHub directly (may be slow for large repos).
-    log_warn "Bundled/PyPI install unavailable, trying GitHub..."
+    if [ "$SDK_INSTALLED" = "0" ]; then
+        log_warn "Bundled/PyPI install unavailable, trying GitHub..."
+        if $PIP_CMD install "git+https://github.com/${GITHUB_REPO}.git@v${VERSION}#subdirectory=sdk/python" >/dev/null 2>&1; then
+            log_success "Python SDK installed from GitHub"
+            SDK_INSTALLED=1
+        elif $PIP_CMD install "git+https://github.com/${GITHUB_REPO}.git#subdirectory=sdk/python" >/dev/null 2>&1; then
+            log_success "Python SDK installed from GitHub (master)"
+            SDK_INSTALLED=1
+        fi
+    fi
 
-    GITHUB_SDK_URL="https://github.com/${GITHUB_REPO}/archive/refs/tags/v${VERSION}.tar.gz"
-    GITHUB_SDK_URL_ALT="https://github.com/${GITHUB_REPO}/archive/refs/heads/master.tar.gz"
-
-    if $PIP_CMD install "git+https://github.com/${GITHUB_REPO}.git@v${VERSION}#subdirectory=sdk/python" >/dev/null 2>&1; then
-        log_success "Python SDK installed from GitHub"
+    if [ "$SDK_INSTALLED" = "0" ]; then
+        log_warn "Could not install Python SDK automatically."
+        log_warn "You can install it manually with:"
+        log_warn "  pip install git+https://github.com/${GITHUB_REPO}.git#subdirectory=sdk/python"
         return 0
     fi
 
-    if $PIP_CMD install "git+https://github.com/${GITHUB_REPO}.git#subdirectory=sdk/python" >/dev/null 2>&1; then
-        log_success "Python SDK installed from GitHub (master)"
+    # Install the branded 'authority' command as a small launcher in
+    # ${INSTALL_BIN} (which env.sh puts on PATH), so 'authority version' works
+    # regardless of where pip drops its own console scripts.
+    install_authority_launcher
+}
+
+install_authority_launcher() {
+    # Only meaningful if the SDK is importable by the chosen interpreter.
+    if ! $PYTHON_CMD -c "import authority_nanos" >/dev/null 2>&1; then
+        log_verbose "authority_nanos not importable by ${PYTHON_CMD}; skipping 'authority' launcher"
         return 0
     fi
 
-    log_warn "Could not install Python SDK automatically."
-    log_warn "You can install it manually with:"
-    log_warn "  pip install authority-nanos"
-    log_warn "  # or"
-    log_warn "  pip install git+https://github.com/${GITHUB_REPO}.git#subdirectory=sdk/python"
+    LAUNCHER="${INSTALL_BIN}/authority"
+    TMP_LAUNCHER="${TEMP_DIR}/authority"
+    cat > "$TMP_LAUNCHER" << EOF
+#!/bin/sh
+# Authority CLI launcher (installed by get.sh) -- dispatches to the Authority
+# Python SDK CLI. Re-run the installer to regenerate.
+exec ${PYTHON_CMD} -m authority_nanos "\$@"
+EOF
+    chmod +x "$TMP_LAUNCHER"
+
+    if [ -w "$INSTALL_BIN" ]; then
+        cp "$TMP_LAUNCHER" "$LAUNCHER" && chmod +x "$LAUNCHER"
+    else
+        sudo cp "$TMP_LAUNCHER" "$LAUNCHER" && sudo chmod +x "$LAUNCHER"
+    fi
+    log_success "Installed 'authority' command to ${LAUNCHER}"
 }
 
 # ============================================================================
@@ -874,15 +904,16 @@ print_next_steps() {
     printf "     %bsource %s/share/authority/env.sh%b\n" "$CYAN" "$PREFIX" "$NC"
     printf "\n"
     printf "  2. Verify the installation:\n"
-    printf "     %bauthority version%b  # or: minops version, ops version\n" "$CYAN" "$NC"
+    printf "     %bminops help%b\n" "$CYAN" "$NC"
     printf "\n"
     printf "  3. Run your first unikernel:\n"
-    printf "     %becho 'print(\"Hello from Authority Nanos!\")' > hello.py%b\n" "$CYAN" "$NC"
+    printf "     %becho 'print(\"Hello from Authority!\")' > hello.py%b\n" "$CYAN" "$NC"
     printf "     %bminops run hello.py%b\n" "$CYAN" "$NC"
     printf "\n"
 
     if [ "$INSTALL_PYTHON" = "1" ]; then
-        printf "  4. Try the Python SDK:\n"
+        printf "  4. Try the Python SDK / CLI:\n"
+        printf "     %bauthority version%b\n" "$CYAN" "$NC"
         printf "     %bpython3 -c \"import authority_nanos; print(authority_nanos.__version__)\"%b\n" "$CYAN" "$NC"
         printf "\n"
     fi
