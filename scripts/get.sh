@@ -460,14 +460,26 @@ install_python_sdk() {
 
     log_info "Installing Python SDK..."
 
-    # Try to install from PyPI
+    # Preferred: install from the SDK bundled in the release tarball we already
+    # downloaded and extracted (SRC_DIR is set by install_binaries). This needs
+    # no network and no git, so it avoids the slow full-history git clone /
+    # on-demand archive of this repo. The SDK has no runtime dependencies.
+    if [ -n "${SRC_DIR:-}" ] && [ -d "${SRC_DIR}/sdk-python" ]; then
+        if $PIP_CMD install "${SRC_DIR}/sdk-python" >/dev/null 2>&1; then
+            log_success "Python SDK installed from release bundle"
+            return 0
+        fi
+        log_verbose "Bundled SDK install failed, falling back to PyPI/GitHub"
+    fi
+
+    # Next: try PyPI (only works once the package is actually published there).
     if $PIP_CMD install --upgrade "${PYPI_PACKAGE}" >/dev/null 2>&1; then
         log_success "Python SDK installed from PyPI"
         return 0
     fi
 
-    # If PyPI fails, try installing from GitHub directly
-    log_warn "PyPI installation failed, trying GitHub..."
+    # Last resort: install from GitHub directly (may be slow for large repos).
+    log_warn "Bundled/PyPI install unavailable, trying GitHub..."
 
     GITHUB_SDK_URL="https://github.com/${GITHUB_REPO}/archive/refs/tags/v${VERSION}.tar.gz"
     GITHUB_SDK_URL_ALT="https://github.com/${GITHUB_REPO}/archive/refs/heads/master.tar.gz"

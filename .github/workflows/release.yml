@@ -119,6 +119,13 @@ jobs:
           cp README.md "$DIST_DIR/"
           cp LICENSE "$DIST_DIR/"
 
+          # Bundle the pure-Python SDK so get.sh can pip-install it straight from
+          # the extracted release tarball (the releases CDN is fast/reliable,
+          # unlike a full-history git clone or on-demand archive of this repo).
+          cp -r sdk/python "$DIST_DIR/sdk-python"
+          find "$DIST_DIR/sdk-python" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$DIST_DIR/sdk-python" -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null || true
+
           # Create tarball
           tar -czvf "authority-nanos-${VERSION}-linux-x86_64.tar.gz" "$DIST_DIR/"
 
@@ -252,6 +259,13 @@ jobs:
           cp README.md "$DIST_DIR/"
           cp LICENSE "$DIST_DIR/"
 
+          # Bundle the pure-Python SDK so get.sh can pip-install it straight from
+          # the extracted release tarball (the releases CDN is fast/reliable,
+          # unlike a full-history git clone or on-demand archive of this repo).
+          cp -r sdk/python "$DIST_DIR/sdk-python"
+          find "$DIST_DIR/sdk-python" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$DIST_DIR/sdk-python" -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null || true
+
           # Create tarball
           tar -czvf "authority-nanos-${VERSION}-linux-arm64.tar.gz" "$DIST_DIR/"
 
@@ -376,6 +390,13 @@ jobs:
           cp README.md "$DIST_DIR/"
           cp LICENSE "$DIST_DIR/"
 
+          # Bundle the pure-Python SDK so get.sh can pip-install it straight from
+          # the extracted release tarball (the releases CDN is fast/reliable,
+          # unlike a full-history git clone or on-demand archive of this repo).
+          cp -r sdk/python "$DIST_DIR/sdk-python"
+          find "$DIST_DIR/sdk-python" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$DIST_DIR/sdk-python" -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null || true
+
           # Create tarball
           tar -czvf "authority-nanos-${VERSION}-darwin-x86_64.tar.gz" "$DIST_DIR/"
 
@@ -499,6 +520,13 @@ jobs:
           # Copy docs
           cp README.md "$DIST_DIR/"
           cp LICENSE "$DIST_DIR/"
+
+          # Bundle the pure-Python SDK so get.sh can pip-install it straight from
+          # the extracted release tarball (the releases CDN is fast/reliable,
+          # unlike a full-history git clone or on-demand archive of this repo).
+          cp -r sdk/python "$DIST_DIR/sdk-python"
+          find "$DIST_DIR/sdk-python" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$DIST_DIR/sdk-python" -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null || true
 
           # Create tarball
           tar -czvf "authority-nanos-${VERSION}-darwin-arm64.tar.gz" "$DIST_DIR/"
