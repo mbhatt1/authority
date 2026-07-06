@@ -44,3 +44,6 @@ latest.txt
 # generated docs site build output
 docs/.vitepress/dist/
 docs/.vitepress/cache/
+
+# Node dependencies (regenerated via npm ci from package-lock.json)
+node_modules/
